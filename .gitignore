@@ -1,0 +1,46 @@
+```gitignore
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual Environment
+venv/
+.env/
+.venv/
+
+# Environment Variables
+.env
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Build / Distribution
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test / Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Local Data Files
+data/raw/*
+!data/raw/.gitkeep
+
+# Temporary Files
+*.tmp
+*.temp
+```
