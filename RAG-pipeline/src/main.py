@@ -1,97 +1,64 @@
-import random
-
+# src/main.py
+import logging
+import time
 from src.models import RawDocument
-from src.engine import IngestionEngine
-from src.vector_store import VectorStoreManager
+from src.chunker import SemanticChunker
+from src.embedder import ProductionEmbedder
+from src.vector_store import ProductionVectorStore
+from src.retrieval import RetrievalEngine
 
-
-def load_file(file_path: str) -> str:
-    """
-    Reads raw text from a file.
-    """
-    with open(file_path, "r", encoding="utf-8") as file:
-        return file.read()
-
-
-def generate_mock_embeddings(
-    num_chunks: int,
-    dimensions: int = 1536
-) -> list:
-    """
-    Generates mock embedding vectors for testing
-    the vector database pipeline.
-    """
-
-    return [
-        [random.uniform(-1.0, 1.0) for _ in range(dimensions)]
-        for _ in range(num_chunks)
-    ]
-
+logger = logging.getLogger("PipelineApplication")
 
 def main():
+    logger.info("Starting Enterprise Ingestion and Retrieval App Framework.")
+    start_time = time.time()
+    
+    # 1. Pipeline Component Orchestration setup
+    chunker = SemanticChunker()
+    embedder = ProductionEmbedder()
+    db = ProductionVectorStore(collection_name="production_knowledge_base", vector_dim=embedder.vector_dim)
+    retrieval_system = RetrievalEngine(vector_store=db, embedder=embedder)
+    
+    # 2. Ingest structured multi-paragraph data
+    sample_document_text = """
+## Platform System Overview
+The engine infrastructure runs cleanly on Python frameworks. It relies heavily on vectorized tensor math matrices to evaluate incoming human prompts.
 
-    print("\n--- Starting AI Ingestion Pipeline ---\n")
+## Cloud Operations Infrastructure
+Deployment runtime automation targets Docker image configurations inside scalable cloud orchestration frameworks. Kubernetes setups drive system resilience, abstracting compute instances out of memory bounds seamlessly.
+"""
+    
+    document = RawDocument.from_text(filename="cloud_architecture_spec.md", raw_text=sample_document_text)
+    
+    # 3. Execution Processing Core
+    chunks = chunker.chunk_document(document)
+    logger.info(f"Document chunking complete. Total segments: {len(chunks)}")
+    
+    # 4. Idempotency Filtering Check
+    chunks_to_process = db.filter_existing_chunks(chunks)
+    logger.info(f"Idempotency filter analysis: {len(chunks_to_process)} / {len(chunks)} chunks require processing.")
+    
+    if chunks_to_process:
+        texts_to_embed = [c.text for c in chunks_to_process]
+        embeddings = embedder.get_embeddings_batched(texts_to_embed)
+        db.upsert_chunks(chunks_to_process, embeddings)
+    else:
+        logger.info("All computed chunk identities exist and are up to date. Processing skipped.")
 
-    # 1. Read raw document
-    file_path = "data/raw/system_design.md"
-
-    raw_text = load_file(file_path)
-
-    # 2. Create structured document object
-    doc = RawDocument.from_text(
-        filename="system_design.md",
-        raw_text=raw_text
-    )
-
-    print(f"Loaded Document ID: {doc.document_id}")
-
-    # 3. Initialize ingestion engine
-    engine = IngestionEngine(
-        chunk_size=30,
-        chunk_overlap=5
-    )
-
-    # 4. Process and chunk document
-    chunks = engine.process_document(doc)
-
-    print(f"Generated {len(chunks)} chunks.\n")
-
-    # 5. Preview chunks
-    print("Previewing First 2 Chunks:\n")
-
-    for chunk in chunks[:2]:
-
-        print("=" * 60)
-        print(f"Chunk ID: {chunk.chunk_id}")
-        print(f"Tokens: {chunk.token_count}")
-        print(f"Metadata: {chunk.metadata}")
-        print(chunk.text)
-        print()
-
-    # 6. Generate mock embeddings
-    print("Generating mock embeddings...\n")
-
-    mock_embeddings = generate_mock_embeddings(
-        num_chunks=len(chunks),
-        dimensions=1536
-    )
-
-    print(f"Generated {len(mock_embeddings)} embedding vectors.")
-
-    # 7. Initialize vector database manager
-    db_manager = VectorStoreManager(
-        collection_name="production_kb",
-        vector_size=1536
-    )
-
-    # 8. Store chunks + embeddings in Qdrant
-    db_manager.upsert_chunks(
-        chunks=chunks,
-        embeddings=mock_embeddings
-    )
-
-    print("\n--- Ingestion Pipeline Completed Successfully ---\n")
-
+    # 5. Live Search Validation Run
+    print("\n" + "="*50)
+    print("LIVE RETRIEVAL SYSTEM SEARCH TEST")
+    print("="*50)
+    
+    search_query = "Tell me about container automation and Kubernetes deployment"
+    retrieved_contexts = retrieval_system.retrieve_context(search_query, top_k=1)
+    
+    for i, context in enumerate(retrieved_contexts):
+        print(f"\nResult #{i+1} (Source File: {context.get('source')})")
+        print(f"Content Match: {context.get('text')}")
+    print("="*50)
+    
+    logger.info(f"Total pipeline cycle completed execution inside {time.time() - start_time:.4f} seconds.")
 
 if __name__ == "__main__":
     main()

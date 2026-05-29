@@ -1,6 +1,6 @@
 import hashlib
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import Dict, Any
 
 @dataclass
 class DocumentChunk:
@@ -8,6 +8,7 @@ class DocumentChunk:
     document_id: str
     text: str
     token_count: int
+    content_hash: str
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
