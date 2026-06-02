@@ -11,47 +11,51 @@ logger = logging.getLogger("VectorStore")
 class ProductionVectorStore:
     def __init__(self, collection_name: str, vector_dim: int):
         self.collection_name = collection_name
-        # Durable, local file-system path persistence
         self.client = QdrantClient(path=Config.QDRANT_STORAGE_PATH)
         self._ensure_collection(vector_dim)
 
     def _ensure_collection(self, vector_dim: int):
-        collections = self.client.get_collections().collections
-        collection_names = [c.name for c in collections]
-
-        if self.collection_name not in collection_names:
-            logger.info(
-                f"Creating collection '{self.collection_name}' with dimension scale {vector_dim}"
-            )
-
+        if not self.client.collection_exists(self.collection_name):
             self.client.create_collection(
                 collection_name=self.collection_name,
-                vectors_config=VectorParams(
-                    size=vector_dim,
-                    distance=Distance.COSINE
-                ),
+                vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
             )
 
-    def filter_existing_chunks(self, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
+    def filter_existing_chunks_batched(self, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
         """
-        Idempotency Guard: Compares document chunk IDs against existing DB targets
-        to skip redundant embedding generation steps.
+        Optimized Batch Idempotency: Gathers all requested IDs and hits the database 
+        in a single combined lookup call to maximize scalability.
         """
+        if not chunks:
+            return []
+
+        # Map stable database integer representation back to objects
+        id_map = {chunk.qdrant_id: chunk for chunk in chunks}
+        target_ids = list(id_map.keys())
+        
+        # Single batched roundtrip call
+        existing_records = self.client.retrieve(
+            collection_name=self.collection_name,
+            ids=target_ids,
+            with_payload=True
+        )
+        
+        existing_payloads = {record.id: record.payload for record in existing_records if record.payload}
+        
         new_chunks = []
-        for chunk in chunks:
-            # Check if this precise chunk ID already exists
-            res = self.client.retrieve(
-                collection_name=self.collection_name,
-                ids=[hash(chunk.chunk_id) % 10**8],
-                with_payload=True
-            )
-            if res and res[0].payload.get("content_hash") == chunk.content_hash:
-                continue # Skip matched identity, no changes detected
-
-            new_chunks.append(chunk) #contains new chunks that need to be embedded and upserted
+        for qid, chunk in id_map.items():
+            if qid in existing_payloads:
+                # Double-check data integrity hashes match perfectly
+                if existing_payloads[qid].get("content_hash") == chunk.content_hash:
+                    continue # Extracted content is completely identical, safe to skip
+            new_chunks.append(chunk)
+            
         return new_chunks
 
-    def upsert_chunks(self, chunks: List[DocumentChunk], embeddings: List[List[float]]):
+    def upsert_chunks_bulk(self, chunks: List[DocumentChunk], embeddings: List[List[float]], batch_size: int = 100):
+        """
+        Streams vector uploads across bounded chunks instead of choking database network lines.
+        """
         points = []
         for chunk, embedding in zip(chunks, embeddings):
             payload = {
@@ -61,25 +65,19 @@ class ProductionVectorStore:
                 "content_hash": chunk.content_hash,
                 **chunk.metadata
             }
-            points.append(
-                PointStruct(
-                    id=hash(chunk.chunk_id) % 10**8,
-                    vector=embedding,
-                    payload=payload
-                )
-            )
-        self.client.upsert(collection_name=self.collection_name, wait=True, points=points)
-        logger.info(f"Successfully synchronized {len(points)} vector records into persistent index.")
+            points.append(PointStruct(id=chunk.qdrant_id, vector=embedding, payload=payload))
+            
+        # Segment arrays into physical sub-batches
+        for i in range(0, len(points), batch_size):
+            batch = points[i:i + batch_size]
+            self.client.upsert(collection_name=self.collection_name, wait=True, points=batch)
+            
+        logger.info(f"Bulk-uploaded {len(points)} vector nodes via batch sized windows.")
 
     def search_similar(self, query_vector: List[float], limit: int = 3, metadata_filter: Dict[str, Any] = None) -> List[Dict[str, Any]]:
-        """
-        Executes query matching combined with optional structural metadata scoping.
-        """
         qdrant_filter = None
         if metadata_filter:
-            conditions = [
-                FieldCondition(key=k, match=MatchValue(value=v)) for k, v in metadata_filter.items()
-            ]
+            conditions = [FieldCondition(key=k, match=MatchValue(value=v)) for k, v in metadata_filter.items()]
             qdrant_filter = Filter(must=conditions)
 
         results = self.client.search(
