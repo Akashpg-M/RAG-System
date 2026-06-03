@@ -1,79 +1,115 @@
 # src/main.py
 import logging
 import time
-from src.models import RawDocument, EmbeddingCache
-from src.chunker import SemanticChunker
+from src.models import RawDocument, EmbeddingCache, KnowledgeGraphIndex
+from src.chunker import HierarchicalGraphChunker
 from src.embedder import ProductionEmbedder
 from src.vector_store import ProductionVectorStore
-from src.retrieval import RetrievalEngine
+from src.retrieval import AgenticRetrievalEngine
 
 logger = logging.getLogger("PipelineApplication")
 
-def main():
-    logger.info("Initializing Highly Scalable Ingestion Pipeline Ecosystem.")
+def compile_production_prompt(query: str, retrieved_nodes: list) -> str:
+    """
+    Production Prompt Framework: Assembles clear context instructions, XML formatting blocks, 
+    Hierarchical (Parent) boundaries, and absolute anti-hallucination guardrails.
+    """
+    context_str = ""
+    graph_str = ""
     
-    # Initialize Core Modules
-    chunker = SemanticChunker()
+    for idx, node in enumerate(retrieved_nodes):
+        # HIERARCHICAL RAG OPTIMIZATION: Pull the broad Parent Context instead of short Child snippets
+        source_text = node.get("parent_context", node.get("text"))
+        context_str += f"\n<document id=\"{node.get('chunk_id')}\" source=\"{node.get('source')}\">\n{source_text}\n</document>\n"
+        
+        if "graph_context_triples" in node:
+            graph_str += json.dumps(node["graph_context_triples"], indent=2)
+
+    prompt_blueprint = f"""
+    You are an expert Enterprise Systems Architecture assistant. Answer the user query using ONLY the verified technical context blocks provided inside the XML tags below.
+
+    <system_operational_rules>
+    1. If the answer cannot be explicitly derived from the provided context, state clearly: "INFORMATION NOT AVAILABLE IN ENTERPRISE KNOWLEDGE BASE."
+    2. Do NOT use outside knowledge or hallucinate assumptions.
+    3. Maintain an authoritative, professional engineering tone.
+    4. Reference the document IDs when drawing factual assertions.
+    </system_operational_rules>
+
+    <structural_knowledge_graph_triples>
+    {graph_str if graph_str else "No explicit relational graph triples extracted for this partition."}
+    </structural_knowledge_graph_triples>
+
+    <verified_knowledge_context>
+    {context_str}
+    </verified_knowledge_context>
+
+    USER QUERY: {query}
+    FINAL EXPERT RESPONSE:
+    """
+    return prompt_blueprint.strip()
+
+def main():
+    logger.info("Starting Enterprise Ingestion & Agentic Retrieval Runtime Application.")
+    
+    # 1. Setup Architecture Dependencies
+    graph_db = KnowledgeGraphIndex()
+    chunker = HierarchicalGraphChunker(graph_index=graph_db)
     embedder = ProductionEmbedder()
     db = ProductionVectorStore(collection_name="production_enterprise_kb", vector_dim=embedder.vector_dim)
     cache = EmbeddingCache()
-    retrieval_system = RetrievalEngine(vector_store=db, embedder=embedder)
+    agentic_search = AgenticRetrievalEngine(store=db, embedder=embedder, graph_index=graph_db)
     
-    # Raw multi-paragraph ingestion data setup
-    sample_document_text = """
-    ## Platform System Overview
-    The engine infrastructure runs cleanly on Python frameworks. It relies heavily on vectorized tensor math matrices to evaluate incoming human prompts.
+    # 2. Document Parsing Pre-processing Phase
+    with open("data/raw/system_design.md", "r") as f:
+        raw_markdown = f.read()
+        
+    doc = RawDocument.from_text(filename="system_design.md", raw_text=raw_markdown)
+    parent_chunks, child_chunks = chunker.process_document(doc)
+    logger.info(f"Ingested text parsed into {len(parent_chunks)} Parent envelopes and {len(child_chunks)} nested Child vectors.")
+
+    # 3. Batch-Optimized DB Idempotency Filter Checks
+    needed_child_chunks = db.filter_existing_chunks_batched(child_chunks)
+    logger.info(f"Idempotency Analysis: {len(needed_child_chunks)} / {len(child_chunks)} vectors require ingestion sync.")
     
-    ## Cloud Operations Infrastructure
-    Deployment runtime automation targets Docker image configurations inside scalable cloud orchestration frameworks. Kubernetes setups drive system resilience, abstracting compute instances out of memory bounds seamlessly.
-    """
-    
-    document = RawDocument.from_text(filename="cloud_architecture_spec.md", raw_text=sample_document_text)
-    
-    # 1. Semantic Slid-Window Context Splitting
-    chunks = chunker.chunk_document(document)
-    logger.info(f"Chunking complete. Yielded {len(chunks)} items with context boundaries.")
-    
-    # 2. Batch-Optimized Database Idempotency Filter Checks
-    uncached_chunks_to_embed = []
+    uncached_chunks = []
     final_embeddings = []
     
-    # Quick filter out items already stored directly inside Vector DB 
-    needed_chunks = db.filter_existing_chunks_batched(chunks)
-    
-    # 3. Layer-2 Local Encoding Cache Check
-    for chunk in needed_chunks:
+    # 4. Layer-2 Local Encoding Cache Processing Core
+    for chunk in needed_child_chunks:
         cached_vector = cache.get(chunk.content_hash)
         if cached_vector:
             final_embeddings.append(cached_vector)
         else:
-            uncached_chunks_to_embed.append(chunk)
+            uncached_chunks.append(chunk)
 
-    # 4. Generate Missing Vectors and Update Cache
-    if uncached_chunks_to_embed:
-        texts_to_compute = [c.text for c in uncached_chunks_to_embed]
-        new_vectors = embedder.get_embeddings_batched(texts_to_compute)
-        
-        # Populate SQLite Cache to avoid re-computing during future runs
-        for chunk, vec in zip(uncached_chunks_to_embed, new_vectors):
-            cache.set(chunk.content_hash, vec)
-            final_embeddings.append(vec)
-            
-    # 5. Continuous Bulk Streaming Sync
-    if needed_chunks:
-        db.upsert_chunks_bulk(needed_chunks, final_embeddings)
+    # 5. Generate Missing Coordinates safely via Fault-Tolerant Batched Engine
+    if uncached_chunks:
+        logger.info(f"Generating vectors for {len(uncached_chunks)} uncached items...")
+        computed_vectors = embedder.get_embeddings_batched([c.text for c in uncached_chunks])
+        for chunk, vector in zip(uncached_chunks, computed_vectors):
+            cache.set(chunk.content_hash, vector)
+            final_embeddings.append(vector)
+
+    # 6. Bulk Streaming Upsert Sync
+    if needed_child_chunks:
+        db.upsert_chunks_bulk(needed_child_chunks, final_embeddings)
+        logger.info("Persistent index data state updated successfully.")
     else:
-        logger.info("Everything is synchronized perfectly. Ingestion pipelines skipped cleanly.")
+        logger.info("All components synchronized perfectly. Ingestion bypassed cleanly.")
 
-    # 6. Real Live RAG Semantic Retrieval Verification
-    print("\n" + "="*50)
-    print("LIVE RETRIEVAL SYSTEM TEST")
-    print("="*50)
-    search_query = "How do we manage python infrastructure and kubernetes?"
-    results = retrieval_system.retrieve_context(search_query, top_k=1)
-    for res in results:
-        print(f"Matched text: {res.get('text')}")
-    print("="*50)
+    # 7. Live System Run & Prompt Compilation
+    user_query = "How do we manage python infrastructure and kubernetes?"
+    retrieved_contexts = agentic_search.retrieve_context(user_query, top_k=1)
+    
+    if retrieved_contexts:
+        production_prompt = compile_production_prompt(user_query, retrieved_contexts)
+        print("\n" + "="*70)
+        print("COMPILED PRODUCTION ENTERPRISE LLM PROMPT")
+        print("="*70)
+        print(production_prompt)
+        print("="*70)
+    else:
+        logger.error("System failed to isolate contextual document reference points.")
 
 if __name__ == "__main__":
     main()
