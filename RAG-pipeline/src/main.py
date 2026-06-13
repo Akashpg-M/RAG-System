@@ -100,12 +100,12 @@ def main():
 
     # Define Domain Ontology (Phase 2 Requirement)
     ontology_path = os.path.join("config", "ontologies", "software.json")
-    
+    aliases_path = os.path.join("config", "ontologies", "aliases.json")
+
     try:
-    # This will strictly validate the JSON before the app is allowed to start
-        domain_ontology = DomainOntology.load_from_file(ontology_path)
+        domain_ontology = DomainOntology.load_pipeline_configs(ontology_path, aliases_path)
     except Exception as e:
-        logger.critical("Failed to boot RAG Engine due to ontology configuration error.")
+        logger.critical(f"System boot aborted. Configuration error: {str(e)}")
         raise SystemExit(1)
     
     # Initialize the decoupled Graph Extractor

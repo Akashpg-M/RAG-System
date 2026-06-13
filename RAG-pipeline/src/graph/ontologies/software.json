@@ -1,0 +1,29 @@
+{
+    "domain": "Software Engineering and Cloud Architecture",
+    "entities": [
+        "SERVICE",
+        "DATABASE",
+        "MESSAGE_BROKER",
+        "API",
+        "FRAMEWORK",
+        "LIBRARY",
+        "PROTOCOL",
+        "INFRASTRUCTURE",
+        "DATA_MODEL",
+        "USER_ACTOR",
+        "SECURITY_POLICY"
+    ],
+    "relations": [
+        "CALLS",
+        "WRITES_TO",
+        "READS_FROM",
+        "USES",
+        "IMPLEMENTS",
+        "DEPENDS_ON",
+        "HOSTS",
+        "MANAGES",
+        "COMMUNICATES_WITH",
+        "TRIGGERS",
+        "SECURES"
+    ]
+}

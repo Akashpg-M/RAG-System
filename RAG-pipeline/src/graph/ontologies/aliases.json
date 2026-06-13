@@ -1,0 +1,25 @@
+{
+    "normalization_map": {
+        "postgres": "PostgreSQL",
+        "postgresql": "PostgreSQL",
+        "pg": "PostgreSQL",
+        "k8s": "Kubernetes",
+        "kube": "Kubernetes",
+        "k8s cluster": "Kubernetes",
+        "aws": "Amazon Web Services",
+        "gcp": "Google Cloud Platform",
+        "azure": "Microsoft Azure",
+        "rest": "REST API",
+        "restful": "REST API",
+        "grpc": "gRPC",
+        "kafka": "Apache Kafka",
+        "rabbitmq": "RabbitMQ",
+        "redis cache": "Redis",
+        "react": "React",
+        "react.js": "React",
+        "vue": "Vue.js",
+        "node": "Node.js",
+        "nodejs": "Node.js",
+        "docker container": "Docker"
+    }
+}
