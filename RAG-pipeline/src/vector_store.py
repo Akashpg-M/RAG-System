@@ -1,10 +1,9 @@
-# src/vector_store.py
 import logging
 from typing import List, Dict, Any
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
-from src.models import DocumentChunk
 from src.config import Config
+from src.models import ChildChunk
 
 logger = logging.getLogger("VectorStore")
 
@@ -15,13 +14,23 @@ class ProductionVectorStore:
         self._ensure_collection(vector_dim)
 
     def _ensure_collection(self, vector_dim: int):
-        if not self.client.collection_exists(self.collection_name):
+        # if not self.client.collection_exists(self.collection_name):
+        #     self.client.create_collection(
+        #         collection_name=self.collection_name,
+        #         vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
+        #     )
+
+        collections_response = self.client.get_collections()
+        existing_collections = [collection.name for collection in collections_response.collections]
+        
+        # Create it if it doesn't exist
+        if self.collection_name not in existing_collections:
             self.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
             )
 
-    def filter_existing_chunks_batched(self, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
+    def filter_existing_chunks_batched(self, chunks: List[ChildChunk]) -> List[ChildChunk]:
         """
         Optimized Batch Idempotency: Gathers all requested IDs and hits the database 
         in a single combined lookup call to maximize scalability.
@@ -52,7 +61,7 @@ class ProductionVectorStore:
             
         return new_chunks
 
-    def upsert_chunks_bulk(self, chunks: List[DocumentChunk], embeddings: List[List[float]], batch_size: int = 100):
+    def upsert_chunks_bulk(self, chunks: List[ChildChunk], embeddings: List[List[float]], batch_size: int = 100):
         """
         Streams vector uploads across bounded chunks instead of choking database network lines.
         """
@@ -60,7 +69,8 @@ class ProductionVectorStore:
         for chunk, embedding in zip(chunks, embeddings):
             payload = {
                 "chunk_id": chunk.chunk_id,
-                "document_id": chunk.document_id,
+                # "document_id": chunk.document_id,
+                "parent_id": chunk.parent_id,
                 "text": chunk.text,
                 "content_hash": chunk.content_hash,
                 **chunk.metadata
@@ -86,4 +96,18 @@ class ProductionVectorStore:
             query_filter=qdrant_filter,
             limit=limit
         )
-        return [hit.payload for hit in results]
+        
+        formatted_hits = []
+        for hit in results:
+            payload_data = hit.payload.copy() if hit.payload else {}
+            payload_data["score"] = hit.score 
+            formatted_hits.append(payload_data)
+
+        return formatted_hits
+    
+    def delete_vector(self, chunk_id: str):
+        from qdrant_client.models import PointIdsList
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=PointIdsList(points=[chunk_id])
+        )

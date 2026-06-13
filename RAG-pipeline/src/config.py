@@ -17,4 +17,4 @@ class Config:
     EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
     CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 256))
     CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 30))
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")

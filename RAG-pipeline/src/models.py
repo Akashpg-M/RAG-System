@@ -1,7 +1,7 @@
-# src/models.py
 import hashlib
 import sqlite3
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
 
@@ -49,51 +49,6 @@ class RawDocument:
         hash_input = f"{filename}{raw_text}".encode('utf-8')
         doc_id = hashlib.sha256(hash_input).hexdigest()[:16]
         return cls(document_id=doc_id, filename=filename, raw_text=raw_text)
-
-class KnowledgeGraphIndex:
-    """
-    Implements an internal Entity-Relationship Knowledge Graph index for Graph RAG.
-    Enables tracking multi-hop connections across separate textual ideas.
-    """
-    def __init__(self):
-        # In-memory adjacency index: { entity_source: [(relationship, entity_target, chunk_id)] }
-        self.graph: Dict[str, List[tuple]] = {}
-
-    def add_triple(self, source: str, relation: str, target: str, chunk_id: str):
-        """Adds an absolute directed relational edge between semantic concepts."""
-        src, tgt = source.strip().lower(), target.strip().lower()
-        if src not in self.graph:
-            self.graph[src] = []
-        self.graph[src].append((relation.strip().lower(), tgt, chunk_id))
-        logger = sqlite3.logging.getLogger("GraphIndex") # Safe log access
-        
-    def traverse_hops(self, seed_entities: List[str], max_hops: int = 1) -> List[Dict[str, str]]:
-        """
-        Traverses the structural adjacency matrix to extract linked conceptual context
-        for a set of queried keywords or seed concepts.
-        """
-        discovered_triples = []
-        visited = set()
-        queue = [(entity.lower(), 0) for entity in seed_entities]
-
-        while queue:
-            current_entity, current_hop = queue.pop(0)
-            if current_entity in visited or current_hop > max_hops:
-                continue
-            visited.add(current_entity)
-
-            if current_entity in self.graph:
-                for relation, target, cid in self.graph[current_entity]:
-                    discovered_triples.append({
-                        "source": current_entity,
-                        "relation": relation,
-                        "target": target,
-                        "chunk_id": cid
-                    })
-                    # Add unvisited neighbors to queue for multi-hop expansion
-                    if target not in visited:
-                        queue.append((target, current_hop + 1))
-        return discovered_triples
 
 class EmbeddingCache:
     """
