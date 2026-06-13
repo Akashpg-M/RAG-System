@@ -1,115 +1,177 @@
 # src/main.py
 import logging
 import time
-from src.models import RawDocument, EmbeddingCache, KnowledgeGraphIndex
-from src.chunker import HierarchicalGraphChunker
-from src.embedder import ProductionEmbedder
+from typing import List, Dict, Any
+import tiktoken
+from groq import Groq
+from src.config import Config
+
+from src.sparse_store import SparseStore
+from src.graph_store import KnowledgeGraphStore
 from src.vector_store import ProductionVectorStore
-from src.retrieval import AgenticRetrievalEngine
+from src.embedder import ProductionEmbedder
+from src.models import EmbeddingCache, ChildChunk
+from src.chunker import SemanticDoclingChunker
+from src.retrievers import DenseRetriever, SparseRetriever, GraphRetriever
+from src.semantic_processor import SemanticQueryProcessor
+from src.retrieval import AgenticRetrievalEngine, RetrieverManager
+from src.fusion import ReciprocalRankFusion
+from src.generation import ProductionResponseGenerator
+from src.queue_worker import IngestionQueueManager
+from src.telemetry import QueryTelemetryTracker
+from src.graph.graph_extractor import GraphExtractor
 
-logger = logging.getLogger("PipelineApplication")
+from src.graph.ontology import DomainOntology
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("EnterpriseRAG")
 
-def compile_production_prompt(query: str, retrieved_nodes: list) -> str:
-    """
-    Production Prompt Framework: Assembles clear context instructions, XML formatting blocks, 
-    Hierarchical (Parent) boundaries, and absolute anti-hallucination guardrails.
-    """
-    context_str = ""
-    graph_str = ""
-    
-    for idx, node in enumerate(retrieved_nodes):
-        # HIERARCHICAL RAG OPTIMIZATION: Pull the broad Parent Context instead of short Child snippets
-        source_text = node.get("parent_context", node.get("text"))
-        context_str += f"\n<document id=\"{node.get('chunk_id')}\" source=\"{node.get('source')}\">\n{source_text}\n</document>\n"
+class ProductionIngestionPipeline:
+    def __init__(self, sparse_store, graph_store, vector_store, embedder, cache, graph_extractor: GraphExtractor):
+        self.sparse_store = sparse_store
+        self.graph_store = graph_store
+        self.vector_store = vector_store
+        self.embedder = embedder
+        self.cache = cache
+        self.extractor = graph_extractor
+
+    def ingest_document(self, file_path: str, chunker: SemanticDoclingChunker):
+        logger.info(f"Background thread starting processing loop for file: {file_path}")
         
-        if "graph_context_triples" in node:
-            graph_str += json.dumps(node["graph_context_triples"], indent=2)
+        # 1. Parse and Chunk
+        parent_chunks, child_chunks = chunker.process_file(file_path, "doc_hash_123")
+        
+        # 2. Incremental Cleanup
+        for chunk in child_chunks:
+            purged = self.sparse_store.delete_by_content_hash(chunk.content_hash)
+            for old_cid in purged:
+                self.graph_store.delete_by_chunk_id(old_cid)
+                if hasattr(self.vector_store, 'delete_vector'):
+                    self.vector_store.delete_vector(old_cid)
 
-    prompt_blueprint = f"""
-    You are an expert Enterprise Systems Architecture assistant. Answer the user query using ONLY the verified technical context blocks provided inside the XML tags below.
+        # 3. Add to Sparse Store
+        self.sparse_store.add_documents(child_chunks)
+        
+        all_extracted_triples = []
+        for p_chunk in parent_chunks:
+            # Long-range structural relationship context window preserved cleanly
+            triples = self.extractor.extract_triples(p_chunk.text)
+            for t in triples:
+                t["chunk_id"] = p_chunk.id  # Correlate back to target chunk identification
+                all_extracted_triples.append(t)
+                
+        # Phase 4 Optimization: Execute a batch graph insertion using a single transactional block commit
+        if all_extracted_triples:
+            self.graph_store.add_triples_bulk(all_extracted_triples)
+            
+        # 4. Add to Vector Store
+        needed_chunks = self.vector_store.filter_existing_chunks_batched(child_chunks)
+        uncached = []
+        final_embeddings = []
+        
+        for chunk in needed_chunks:
+            cached_vec = self.cache.get(chunk.content_hash)
+            if cached_vec:
+                final_embeddings.append(cached_vec)
+            else:
+                uncached.append(chunk)
 
-    <system_operational_rules>
-    1. If the answer cannot be explicitly derived from the provided context, state clearly: "INFORMATION NOT AVAILABLE IN ENTERPRISE KNOWLEDGE BASE."
-    2. Do NOT use outside knowledge or hallucinate assumptions.
-    3. Maintain an authoritative, professional engineering tone.
-    4. Reference the document IDs when drawing factual assertions.
-    </system_operational_rules>
+        if uncached:
+            computed_vectors = self.embedder.get_embeddings_batched([c.text for c in uncached])
+            for chunk, vector in zip(uncached, computed_vectors):
+                self.cache.set(chunk.content_hash, vector)
+                final_embeddings.append(vector)
 
-    <structural_knowledge_graph_triples>
-    {graph_str if graph_str else "No explicit relational graph triples extracted for this partition."}
-    </structural_knowledge_graph_triples>
-
-    <verified_knowledge_context>
-    {context_str}
-    </verified_knowledge_context>
-
-    USER QUERY: {query}
-    FINAL EXPERT RESPONSE:
-    """
-    return prompt_blueprint.strip()
+        if needed_chunks:
+            self.vector_store.upsert_chunks_bulk(needed_chunks, final_embeddings)
+            
+        logger.info(f"Successfully processed and indexed document in background thread.")
 
 def main():
-    logger.info("Starting Enterprise Ingestion & Agentic Retrieval Runtime Application.")
+    logger.info("Initializing Telemetry-monitored RAG Node...")
     
-    # 1. Setup Architecture Dependencies
-    graph_db = KnowledgeGraphIndex()
-    chunker = HierarchicalGraphChunker(graph_index=graph_db)
+    # 1. Storage & Primitives
+    graph_db = KnowledgeGraphStore(db_path="graph_store.db")
+    sparse_db = SparseStore(db_path="sparse_index.db")
     embedder = ProductionEmbedder()
-    db = ProductionVectorStore(collection_name="production_enterprise_kb", vector_dim=embedder.vector_dim)
     cache = EmbeddingCache()
-    agentic_search = AgenticRetrievalEngine(store=db, embedder=embedder, graph_index=graph_db)
-    
-    # 2. Document Parsing Pre-processing Phase
-    with open("data/raw/system_design.md", "r") as f:
-        raw_markdown = f.read()
-        
-    doc = RawDocument.from_text(filename="system_design.md", raw_text=raw_markdown)
-    parent_chunks, child_chunks = chunker.process_document(doc)
-    logger.info(f"Ingested text parsed into {len(parent_chunks)} Parent envelopes and {len(child_chunks)} nested Child vectors.")
+    vector_db = ProductionVectorStore(collection_name="enterprise_kb", vector_dim=embedder.vector_dim)
 
-    # 3. Batch-Optimized DB Idempotency Filter Checks
-    needed_child_chunks = db.filter_existing_chunks_batched(child_chunks)
-    logger.info(f"Idempotency Analysis: {len(needed_child_chunks)} / {len(child_chunks)} vectors require ingestion sync.")
-    
-    uncached_chunks = []
-    final_embeddings = []
-    
-    # 4. Layer-2 Local Encoding Cache Processing Core
-    for chunk in needed_child_chunks:
-        cached_vector = cache.get(chunk.content_hash)
-        if cached_vector:
-            final_embeddings.append(cached_vector)
-        else:
-            uncached_chunks.append(chunk)
+    llm_client = Groq(api_key=Config.GROQ_API_KEY)
 
-    # 5. Generate Missing Coordinates safely via Fault-Tolerant Batched Engine
-    if uncached_chunks:
-        logger.info(f"Generating vectors for {len(uncached_chunks)} uncached items...")
-        computed_vectors = embedder.get_embeddings_batched([c.text for c in uncached_chunks])
-        for chunk, vector in zip(uncached_chunks, computed_vectors):
-            cache.set(chunk.content_hash, vector)
-            final_embeddings.append(vector)
+    # Define Domain Ontology (Phase 2 Requirement)
+    ontology_path = os.path.join("config", "ontologies", "software.json")
+    
+    try:
+    # This will strictly validate the JSON before the app is allowed to start
+        domain_ontology = DomainOntology.load_from_file(ontology_path)
+    except Exception as e:
+        logger.critical("Failed to boot RAG Engine due to ontology configuration error.")
+        raise SystemExit(1)
+    
+    # Initialize the decoupled Graph Extractor
+    graph_extractor = GraphExtractor(
+        llm_client=llm_client, 
+        model_name="llama3-70b-8192", 
+        ontology=domain_ontology
+    )
 
-    # 6. Bulk Streaming Upsert Sync
-    if needed_child_chunks:
-        db.upsert_chunks_bulk(needed_child_chunks, final_embeddings)
-        logger.info("Persistent index data state updated successfully.")
+    # 2. Ingestion Setup
+    # Fixed: Chunker now receives the underlying embedder/tokenizer instance, not the graph database
+    # Initialize the token counter for the chunker
+    token_encoder = tiktoken.get_encoding("cl100k_base")
+    
+    # Pass the token encoder (NOT the vector embedder) to the chunker
+    chunker = SemanticDoclingChunker(encoder_instance=token_encoder)
+
+    # Fixed: Injected the newly configured graph_extractor instance into the pipeline pipeline
+    pipeline = ProductionIngestionPipeline(
+        sparse_store=sparse_db, 
+        graph_store=graph_db, 
+        vector_store=vector_db, 
+        embedder=embedder, 
+        cache=cache,
+        graph_extractor=graph_extractor
+    )
+    
+    queue_manager = IngestionQueueManager(ingestion_pipeline=pipeline, chunker=chunker)
+
+    # Submit an initial ingestion task smoothly
+    try:
+        task_id = queue_manager.submit_task("data/raw/system_design.md")
+        logger.info(f"Check execution state via Endpoint UUID: {task_id}")
+        logger.info("Waiting 15 seconds for Docling parsing and LLM Graph Extraction to complete...")
+        time.sleep(15)
+    except Exception as e:
+        logger.warning(f"Skipping test ingestion: {str(e)}")
+
+    # 3. Retrieval Engine Setup
+    dense_ret = DenseRetriever(vector_store=vector_db, embedder=embedder, cache=cache)
+    sparse_ret = SparseRetriever(sparse_store=sparse_db)
+    graph_ret = GraphRetriever(graph_store=graph_db, sparse_store=sparse_db)
+    
+    manager = RetrieverManager(dense=dense_ret, sparse=sparse_ret, graph=graph_ret)
+    engine = AgenticRetrievalEngine(processor=SemanticQueryProcessor(), manager=manager, fusion_strategy=ReciprocalRankFusion())
+    generator = ProductionResponseGenerator()
+
+    # 4. Execution & Telemetry
+    telemetry = QueryTelemetryTracker()
+    search_query = "What is the retry policy configuration for database connections?"
+    
+    t_start = telemetry.start_timer()
+    fused_context = engine.retrieve_context(search_query, top_k=2)
+    telemetry.stop_timer("total_retrieval_and_rerank", t_start)
+    
+    if fused_context:
+        t_gen = telemetry.start_timer()
+        print("\nSTREAMING RESPONSE:")
+        for token in generator.generate_stream(search_query, fused_context):
+            print(token, end="", flush=True)
+        print("\n")
+        telemetry.stop_timer("llm_generation", t_gen)
     else:
-        logger.info("All components synchronized perfectly. Ingestion bypassed cleanly.")
+        logger.warning("No context found for the query.")
 
-    # 7. Live System Run & Prompt Compilation
-    user_query = "How do we manage python infrastructure and kubernetes?"
-    retrieved_contexts = agentic_search.retrieve_context(user_query, top_k=1)
-    
-    if retrieved_contexts:
-        production_prompt = compile_production_prompt(user_query, retrieved_contexts)
-        print("\n" + "="*70)
-        print("COMPILED PRODUCTION ENTERPRISE LLM PROMPT")
-        print("="*70)
-        print(production_prompt)
-        print("="*70)
-    else:
-        logger.error("System failed to isolate contextual document reference points.")
+    telemetry.emit_telemetry_report()
 
 if __name__ == "__main__":
     main()
