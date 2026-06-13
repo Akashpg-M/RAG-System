@@ -1,101 +1,97 @@
-# src/retrieval.py
 import logging
-from typing import List, Dict, Any
+import concurrent.futures
+from typing import List, Dict, Any, Optional, Protocol
 from sentence_transformers import CrossEncoder
-from src.embedder import ProductionEmbedder
-from src.vector_store import ProductionVectorStore
-from src.models import KnowledgeGraphIndex
+
+from src.semantic_processor import SemanticQueryProcessor
+from src.retrievers import DenseRetriever, SparseRetriever, GraphRetriever
+from src.fusion import FusionStrategy, ReciprocalRankFusion
 
 logger = logging.getLogger("AgenticRetrievalEngine")
 
+# FUSION STRATEGY PATTERN
+class FusionStrategy(Protocol):
+    def fuse(self, list_of_ranked_lists: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]: ...
+
+class ReciprocalRankFusion:
+    def __init__(self, k: int = 60):
+        self.k = k
+
+    def fuse(self, list_of_ranked_lists: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        fused_map = {}
+        for ranked_list in list_of_ranked_lists:
+            for rank, doc in enumerate(ranked_list, start=1):
+                cid = doc["chunk_id"]
+                if cid not in fused_map:
+                    fused_map[cid] = doc.copy()
+                    fused_map[cid]["rrf_score"] = 0.0
+                
+                # Consolidate raw scores for debugging visibility
+                for score_type in ["dense_score", "sparse_score", "graph_score"]:
+                    if doc.get(score_type) is not None:
+                        fused_map[cid][score_type] = doc[score_type]
+                        
+                fused_map[cid]["rrf_score"] += 1.0 / (self.k + rank)
+                
+        fused_list = list(fused_map.values())
+        fused_list.sort(key=lambda x: x["rrf_score"], reverse=True)
+        return fused_list
+ 
+# PARALLEL RETRIEVER MANAGER
+class RetrieverManager:
+    """Manages thread-safe concurrent execution across distinct indices."""
+    def __init__(self, dense: DenseRetriever, sparse: SparseRetriever, graph: GraphRetriever):
+        self.dense = dense
+        self.sparse = sparse
+        self.graph = graph
+
+    def execute_routing(self, semantic_payload: Dict[str, Any], top_k: int = 10, filters: Optional[Dict[str, Any]] = None) -> List[List[Dict[str, Any]]]:
+        results_matrix = []
+        
+        # Execute all retrieval streams in parallel across an optimized worker pool
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            future_sparse = executor.submit(self.sparse.retrieve, semantic_payload["original_query"], top_k, filters)
+            future_dense_rewrite = executor.submit(self.dense.retrieve, semantic_payload["rewritten_query"], top_k, filters)
+            future_dense_hyde = executor.submit(self.dense.retrieve, semantic_payload["hyde_document"], top_k, filters)
+            future_graph = executor.submit(self.graph.retrieve, semantic_payload["original_query"], top_k, filters)
+            
+            # Re-collect the standardized payloads as threads finish execution
+            results_matrix.append(future_sparse.result())
+            results_matrix.append(future_dense_rewrite.result())
+            results_matrix.append(future_dense_hyde.result())
+            results_matrix.append(future_graph.result())
+            
+        return results_matrix
+
+# CORE ORCHESTRATOR
 class AgenticRetrievalEngine:
-    """
-    Enterprise Orchestrator: Drives query expansions, graph traversals, 
-    hybrid synthesis scoring, cross-encoder reranking, and self-correcting agent logic.
-    """
-    def __init__(self, store: ProductionVectorStore, embedder: ProductionEmbedder, graph_index: KnowledgeGraphIndex):
-        self.store = store
-        self.embedder = embedder
-        self.graph_index = graph_index
-        # Load high-precision local CrossEncoder model for deep conceptual verification
-        logger.info("Loading Cross-Encoder neural re-ranking layer...")
+    def __init__(self, processor: SemanticQueryProcessor, manager: RetrieverManager, fusion_strategy: FusionStrategy):
+        self.processor = processor
+        self.manager = manager
+        self.fusion = fusion_strategy
         self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-    def rewrite_query(self, query: str) -> str:
-        """
-        Query Rewriting Layer: Cleans linguistical noise and normalizes phrasing 
-        to maximize vocabulary alignment with underlying vector indexes.
-        """
-        cleaned = query.lower().replace("how do we manage", "").replace("tell me about", "")
-        return cleaned.strip()
-
-    def expand_query(self, query: str) -> List[str]:
-        """
-        Query Expansion Layer: Splits an incoming request into multiple parallel paths 
-        to target different semantic angles of the knowledge base.
-        """
-        base = self.rewrite_query(query)
-        # Generates orthogonal technical formulations to broaden candidate retrieval matching
-        return [base, f"infrastructure architecture configurations for {base}", f"deployment specifications and operations for {base}"]
-
-    def extract_seed_entities(self, query: str) -> List[str]:
-        """Simple rules-based entity extractor to locate seed anchors for the Graph traversal loop."""
-        keywords = ["python", "kubernetes", "docker", "workers", "architecture", "deployment", "infrastructure", "engine"]
-        return [word for word in keywords if word in query.lower()]
-
-    def retrieve_context(self, query_text: str, top_k: int = 2) -> List[Dict[str, Any]]:
-        """
-        The Agentic Multi-Route Loop: Evaluates the query, expands search constraints, 
-        combines Vector and Graph structures, self-corrects results, and executes reranking.
-        """
-        logger.info(f"Agent processing query routing execution: '{query_text}'")
+    def retrieve_context(self, query_text: str, top_k: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        # 1. Semantic Processing
+        semantic_data = self.processor.process_query(query_text)
         
-        # 1. Linguistic Processors
-        expanded_queries = self.expand_query(query_text)
-        logger.info(f"Query expansion generated sub-search matrix: {expanded_queries}")
-
-        # 2. Parallel Vector Base Search
-        candidate_payloads = []
-        seen_chunk_ids = set()
+        # 2. Concurrent Retrieval execution
+        retrieved_matrices = self.manager.execute_routing(semantic_data, top_k=10, filters=filters)
         
-        for sub_query in expanded_queries:
-            q_vector = self.embedder.get_embeddings_batched([sub_query])[0]
-            hits = self.store.search_similar(q_vector, limit=5)
-            for hit in hits:
-                if hit["chunk_id"] not in seen_chunk_ids:
-                    seen_chunk_ids.add(hit["chunk_id"])
-                    candidate_payloads.append(hit)
-
-        # 3. Graph RAG Execution Step
-        seeds = self.extract_seed_entities(query_text)
-        graph_triples = self.graph_index.traverse_hops(seeds, max_hops=1)
-        if graph_triples:
-            logger.info(f"Graph RAG active. Extracted semantic context relations: {graph_triples}")
-
-        # 4. Agentic Evaluation / Self-Correction Layer
-        # If vector candidate quality score drops too low, dynamically pull backup data pipelines
-        if not candidate_payloads and graph_triples:
-            logger.warning("Vector search missed. Agent redirecting exclusively to structured Graph fallback pipelines.")
-            # Self-correcting routine would look up chunks bound to graph_triples here
-
-        if not candidate_payloads:
-            return []
-
-        # 5. Cross-Encoder Contextual Reranking
-        # Pairs the original query against candidate text segments to evaluate non-linear semantic match
-        rerank_inputs = [[query_text, candidate["text"]] for candidate in candidate_payloads]
+        # 3. Apply Pluggable Fusion Strategy
+        fused_pool = self.fusion.fuse(retrieved_matrices)
+        if not fused_pool: return []
+            
+        # 4. Capped Cross-Encoder Reranking
+        # Limit the pool to 3x the top_k requested to save massive compute time
+        rerank_cap = top_k * 3
+        candidate_pool = fused_pool[:rerank_cap]
+        
+        rerank_inputs = [[query_text, candidate["text"]] for candidate in candidate_pool]
         rerank_scores = self.reranker.predict(rerank_inputs).tolist()
         
-        for candidate, score in zip(candidate_payloads, rerank_scores):
-            # Inject raw score directly into structural tracking payload
-            candidate["rerank_relevance_score"] = score
-
-        # Re-sort candidates based on neural model validation scores
-        candidate_payloads.sort(key=lambda x: x["rerank_relevance_score"], reverse=True)
-        
-        # Append extracted graph relations directly onto top context items to inject rich link data
-        final_results = candidate_payloads[:top_k]
-        if final_results and graph_triples:
-            final_results[0]["graph_context_triples"] = graph_triples
-
-        return final_results
+        for candidate, score in zip(candidate_pool, rerank_scores):
+            candidate["rerank_score"] = score
+            
+        candidate_pool.sort(key=lambda x: x["rerank_score"], reverse=True)
+        return candidate_pool[:top_k]
