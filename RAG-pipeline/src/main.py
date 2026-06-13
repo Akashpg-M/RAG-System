@@ -1,6 +1,7 @@
 # src/main.py
 import logging
 import time
+import os
 from typing import List, Dict, Any
 import tiktoken
 from groq import Groq
