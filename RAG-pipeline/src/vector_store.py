@@ -1,16 +1,22 @@
 import logging
+import hashlib
 from typing import List, Dict, Any
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, PointIdsList
 from src.config import Config
 from src.models import ChildChunk
 
 logger = logging.getLogger("VectorStore")
 
+
+def qdrant_point_id(chunk_id: str) -> int:
+    digest = hashlib.sha256(chunk_id.encode("utf-8")).hexdigest()
+    return int(digest[:15], 16)
+
 class ProductionVectorStore:
-    def __init__(self, collection_name: str, vector_dim: int):
+    def __init__(self, collection_name: str, vector_dim: int, storage_path: str = None):
         self.collection_name = collection_name
-        self.client = QdrantClient(path=Config.QDRANT_STORAGE_PATH)
+        self.client = QdrantClient(path=storage_path or Config.QDRANT_STORAGE_PATH)
         self._ensure_collection(vector_dim)
 
     def _ensure_collection(self, vector_dim: int):
@@ -39,7 +45,7 @@ class ProductionVectorStore:
             return []
 
         # Map stable database integer representation back to objects
-        id_map = {chunk.qdrant_id: chunk for chunk in chunks}
+        id_map = {qdrant_point_id(chunk.chunk_id): chunk for chunk in chunks}
         target_ids = list(id_map.keys())
         
         # Single batched roundtrip call
@@ -65,17 +71,20 @@ class ProductionVectorStore:
         """
         Streams vector uploads across bounded chunks instead of choking database network lines.
         """
+        if len(chunks) != len(embeddings):
+            raise ValueError("Every chunk must have exactly one embedding")
         points = []
         for chunk, embedding in zip(chunks, embeddings):
             payload = {
                 "chunk_id": chunk.chunk_id,
-                # "document_id": chunk.document_id,
+                "document_id": chunk.document_id,
                 "parent_id": chunk.parent_id,
                 "text": chunk.text,
                 "content_hash": chunk.content_hash,
+                "metadata": chunk.metadata,
                 **chunk.metadata
             }
-            points.append(PointStruct(id=chunk.qdrant_id, vector=embedding, payload=payload))
+            points.append(PointStruct(id=qdrant_point_id(chunk.chunk_id), vector=embedding, payload=payload))
             
         # Segment arrays into physical sub-batches
         for i in range(0, len(points), batch_size):
@@ -106,8 +115,31 @@ class ProductionVectorStore:
         return formatted_hits
     
     def delete_vector(self, chunk_id: str):
-        from qdrant_client.models import PointIdsList
         self.client.delete(
             collection_name=self.collection_name,
-            points_selector=PointIdsList(points=[chunk_id])
+            points_selector=PointIdsList(points=[qdrant_point_id(chunk_id)]),
+            wait=True,
         )
+
+    def delete_document(self, document_id: str):
+        query_filter = Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))])
+        point_ids = []
+        offset = None
+        while True:
+            records, offset = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=query_filter,
+                limit=256,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            point_ids.extend(record.id for record in records)
+            if offset is None:
+                break
+        if point_ids:
+            self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=PointIdsList(points=point_ids),
+                wait=True,
+            )

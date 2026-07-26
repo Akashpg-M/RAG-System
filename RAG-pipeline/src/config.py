@@ -1,20 +1,25 @@
-# src/config.py
-import os
+"""Legacy configuration facade; new code receives ``AppConfig`` explicitly."""
+
 import logging
-from dotenv import load_dotenv
 
-load_dotenv()
+from src.application.config import AppConfig, Profile, load_config, profile_config
 
-# Setup structured logging configuration
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler()],
 )
 
+_legacy = load_config(Profile.LOCAL)
+
+
 class Config:
-    QDRANT_STORAGE_PATH = os.getenv("QDRANT_STORAGE_PATH", "./qdrant_local_data")
-    EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
-    CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 256))
-    CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 30))
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+    QDRANT_STORAGE_PATH = _legacy.storage.qdrant_path
+    EMBEDDING_MODEL_NAME = _legacy.models.embedding_model
+    CHUNK_SIZE = _legacy.pipeline.chunk_size
+    CHUNK_OVERLAP = _legacy.pipeline.chunk_overlap
+    GROQ_API_KEY = _legacy.models.groq_api_key
+    GROQ_MODEL_NAME = _legacy.models.groq_model
+
+
+__all__ = ["AppConfig", "Config", "Profile", "load_config", "profile_config"]

@@ -2,13 +2,13 @@
 import json
 import os
 from typing import List, Dict
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 class DomainOntology(BaseModel):
     domain: str
     entities: List[str]
     relations: List[str]
-    normalization_map: Dict[str, str] = {}
+    normalization_map: Dict[str, str] = Field(default_factory=dict)
 
     @classmethod
     def load_pipeline_configs(cls, ontology_path: str, aliases_path: str) -> "DomainOntology":

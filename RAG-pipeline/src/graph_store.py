@@ -32,20 +32,39 @@ class KnowledgeGraphStore:
             conn.execute("DELETE FROM triples WHERE chunk_id = ?", (chunk_id,))
             conn.commit()
 
-    def add_triples_bulk(self, triples: List[Dict[str, str]], chunk_id: str):
-        if not triples: return
+    def add_triples_bulk(self, triples: List[Dict[str, str]], chunk_id: str = None):
+        if not triples:
+            return
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             for t in triples:
+                target_chunk_id = t.get("chunk_id") or chunk_id
                 source = t.get("source", "").strip().lower()
                 relation = t.get("relation", "").strip().lower()
                 target = t.get("target", "").strip().lower()
-                if source and relation and target:
-                    cursor.execute("INSERT OR IGNORE INTO triples VALUES (?, ?, ?, ?)", (source, relation, target, chunk_id))
+                if source and relation and target and target_chunk_id:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO triples VALUES (?, ?, ?, ?)",
+                        (source, relation, target, target_chunk_id),
+                    )
+            conn.commit()
+
+    def delete_by_chunk_ids(self, chunk_ids: List[str]):
+        if not chunk_ids:
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            placeholders = ",".join("?" for _ in chunk_ids)
+            conn.execute(f"DELETE FROM triples WHERE chunk_id IN ({placeholders})", chunk_ids)
+            conn.commit()
+
+    def delete_document(self, document_id: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM triples WHERE chunk_id LIKE ?", (f"{document_id}#%",))
             conn.commit()
 
     def traverse_graph_hops(self, seed_entities: List[str], max_hops: int = 1) -> List[Dict[str, Any]]:
-        if not seed_entities: return []
+        if not seed_entities:
+            return []
 
         discovered_triples = []
         visited_nodes = set()
@@ -59,8 +78,11 @@ class KnowledgeGraphStore:
             while queue:
                 current_entity, current_hop = queue.popleft() # Fast O(1) pointer shifts
                 
-                if current_entity in visited_nodes or current_hop > max_hops: continue
+                if current_entity in visited_nodes:
+                    continue
                 visited_nodes.add(current_entity)
+                if current_hop >= max_hops:
+                    continue
 
                 cursor.execute("SELECT relation, target, chunk_id FROM triples WHERE source = ?", (current_entity,))
                 edges = cursor.fetchall()

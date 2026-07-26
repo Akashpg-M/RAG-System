@@ -1,7 +1,7 @@
 # src/graph/graph_extractor.py
 import json
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from src.graph.prompt_builder import PromptBuilder
 from src.graph.ontology import DomainOntology
 
@@ -16,13 +16,16 @@ class GraphExtractor:
         self.model_name = model_name
         self.ontology = ontology
         self.system_prompt = PromptBuilder.build(ontology.model_dump())        
-        self.allowed_entities = set(ontology.entities)
+        self.allowed_entities = set(ontology.entities) | {"DOMAIN_CONCEPT"}
         self.allowed_relations = set(ontology.relations)
 
     def extract_triples(self, text: str) -> List[Dict[str, Any]]:
         """
         Executes synchronous extraction, schema validation, and ontology filtering.
         """
+        if self.client is None:
+            logger.warning("Graph extraction skipped because no LLM client is configured")
+            return []
         try:
             # Polymorphic wrapper to support multiple providers (Groq/OpenAI/Ollama)
             response = self.client.chat.completions.create(

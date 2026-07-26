@@ -46,12 +46,14 @@ from src.config import Config
 logger = logging.getLogger("DoclingChunker")
 
 class SemanticDoclingChunker:
-    def __init__(self, encoder_instance: Any):
+    def __init__(self, encoder_instance: Any, child_size: int = None, child_overlap: int = None):
         self.encoder = encoder_instance
         self.clean_regex = re.compile(r'\s+')
         self.converter = DocumentConverter()
-        self.child_size = Config.CHUNK_SIZE
-        self.child_overlap = Config.CHUNK_OVERLAP
+        self.child_size = child_size if child_size is not None else Config.CHUNK_SIZE
+        self.child_overlap = child_overlap if child_overlap is not None else Config.CHUNK_OVERLAP
+        if self.child_overlap < 0 or self.child_overlap >= self.child_size:
+            raise ValueError("CHUNK_OVERLAP must be non-negative and smaller than CHUNK_SIZE")
 
     @lru_cache(maxsize=4096)
     def cached_token_count(self, text: str) -> int:
@@ -61,6 +63,21 @@ class SemanticDoclingChunker:
     def _split_into_sentences(self, text: str) -> List[str]:
         sentence_end = re.compile(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s')
         return [s.strip() for s in sentence_end.split(text) if s.strip()]
+
+    def _split_token_windows(self, text: str) -> List[str]:
+        token_ids = self.encoder.encode(text)
+        step = self.child_size - self.child_overlap
+        if step <= 0:
+            raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE")
+        windows = []
+        for start in range(0, len(token_ids), step):
+            window_ids = token_ids[start:start + self.child_size]
+            if not window_ids:
+                break
+            windows.append(self.encoder.decode(window_ids).strip())
+            if start + self.child_size >= len(token_ids):
+                break
+        return windows
 
     def process_file(self, file_path: str, doc_id: str) -> Tuple[List[ParentChunk], List[ChildChunk]]:
         logger.info(f"Docling parsing AST for file: {file_path}")
@@ -128,6 +145,7 @@ class SemanticDoclingChunker:
 
         parent_chunk = ParentChunk(
             parent_id=parent_id,
+            document_id=doc_id,
             text=parent_text,
             metadata={"source": file_path, "title": title}
         )
@@ -155,6 +173,20 @@ class SemanticDoclingChunker:
                     temp_tokens = 0
                     for s in sentences:
                         s_tok = self.cached_token_count(s)
+                        if s_tok > self.child_size:
+                            if temp_sentences:
+                                child_chunks.append(self._build_child_node(
+                                    file_path, doc_id, parent_chunk, child_idx, temp_sentences
+                                ))
+                                child_idx += 1
+                                temp_sentences = []
+                                temp_tokens = 0
+                            for window in self._split_token_windows(s):
+                                child_chunks.append(self._build_child_node(
+                                    file_path, doc_id, parent_chunk, child_idx, [window]
+                                ))
+                                child_idx += 1
+                            continue
                         if temp_tokens + s_tok > self.child_size and temp_sentences:
                             child_chunks.append(self._build_child_node(file_path, doc_id, parent_chunk, child_idx, temp_sentences))
                             child_idx += 1
@@ -210,6 +242,7 @@ class SemanticDoclingChunker:
 
         return ChildChunk(
             chunk_id=c_id,
+            document_id=doc_id,
             parent_id=parent.parent_id,
             text=combined_text,
             token_count=self.cached_token_count(combined_text),

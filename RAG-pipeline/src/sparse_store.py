@@ -21,12 +21,16 @@ class SparseStore:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS documents (
                     chunk_id TEXT PRIMARY KEY,
+                    document_id TEXT,
                     parent_id TEXT,
                     doc_len INTEGER,
                     payload TEXT,
                     content_hash TEXT
                 )
             """)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(documents)")}
+            if "document_id" not in columns:
+                conn.execute("ALTER TABLE documents ADD COLUMN document_id TEXT")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS postings (
                     token TEXT,
@@ -45,6 +49,7 @@ class SparseStore:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_postings_token ON postings(token)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_parent ON documents(parent_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_document ON documents(document_id)")
             conn.commit()
 
     def delete_by_content_hash(self, content_hash: str) -> List[str]:
@@ -57,9 +62,24 @@ class SparseStore:
             if chunk_ids:
                 placeholders = ",".join(["?"] * len(chunk_ids))
                 cursor.execute(f"DELETE FROM postings WHERE chunk_id IN ({placeholders})", chunk_ids)
-                cursor.execute(f"DELETE FROM documents WHERE content_hash = ?", (content_hash,))
+                cursor.execute("DELETE FROM documents WHERE content_hash = ?", (content_hash,))
                 conn.commit()
-            return chunk_ids
+        if chunk_ids:
+            self.recalculate_corpus_stats()
+        return chunk_ids
+
+    def delete_document(self, document_id: str) -> List[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT chunk_id FROM documents WHERE document_id = ?", (document_id,))
+            chunk_ids = [row[0] for row in cursor.fetchall()]
+            if chunk_ids:
+                placeholders = ",".join("?" for _ in chunk_ids)
+                cursor.execute(f"DELETE FROM postings WHERE chunk_id IN ({placeholders})", chunk_ids)
+                cursor.execute("DELETE FROM documents WHERE document_id = ?", (document_id,))
+                conn.commit()
+        self.recalculate_corpus_stats()
+        return chunk_ids
 
     def recalculate_corpus_stats(self):
         """Pre-computes and caches corpus metrics to completely eliminate real-time table scans."""
@@ -75,20 +95,26 @@ class SparseStore:
             conn.commit()
 
     def add_documents(self, chunks: List[ChildChunk]):
-        if not chunks: return
+        if not chunks:
+            return
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             for chunk in chunks:
                 tokens = canonical_tokenizer.tokenize(chunk.text)
-                if not tokens: continue
+                if not tokens:
+                    continue
                 
                 payload = json.dumps({
                     "chunk_id": chunk.chunk_id, "parent_id": chunk.parent_id,
                     "text": chunk.text, "metadata": chunk.metadata
                 })
+                # REPLACE does not cascade because SQLite foreign keys are off by
+                # default, so stale postings must be removed explicitly.
+                cursor.execute("DELETE FROM postings WHERE chunk_id = ?", (chunk.chunk_id,))
                 cursor.execute(
-                    "INSERT OR REPLACE INTO documents VALUES (?, ?, ?, ?, ?)",
-                    (chunk.chunk_id, chunk.parent_id, len(tokens), payload, chunk.content_hash)
+                    "INSERT OR REPLACE INTO documents "
+                    "(chunk_id, document_id, parent_id, doc_len, payload, content_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                    (chunk.chunk_id, chunk.document_id, chunk.parent_id, len(tokens), payload, chunk.content_hash)
                 )
                 
                 local_freqs = {}
@@ -102,7 +128,8 @@ class SparseStore:
 
     def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         query_tokens = canonical_tokenizer.tokenize(query)
-        if not query_tokens: return []
+        if not query_tokens:
+            return []
 
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -115,7 +142,8 @@ class SparseStore:
             
             corpus_size = size_row[0] if size_row else 0
             avg_doc_len = len_row[0] if len_row else 0.0
-            if corpus_size == 0: return []
+            if corpus_size == 0:
+                return []
 
             placeholders = ",".join(["?"] * len(query_tokens))
             cursor.execute(f"""
@@ -135,7 +163,8 @@ class SparseStore:
         candidate_scores = {}
         for token, chunk_id, tf, doc_len, payload_str in raw_postings:
             doc_count = dfs.get(token, 0)
-            if doc_count == 0: continue
+            if doc_count == 0:
+                continue
             
             idf = math.log((corpus_size - doc_count + 0.5) / (doc_count + 0.5) + 1.0)
             numerator = tf * (self.k1 + 1)
@@ -155,3 +184,11 @@ class SparseStore:
 
         results.sort(key=lambda x: x["sparse_score"], reverse=True)
         return results[:top_k]
+
+    def get_by_chunk_or_parent(self, identifier: str) -> List[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT payload FROM documents WHERE chunk_id = ? OR parent_id = ?",
+                (identifier, identifier),
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]

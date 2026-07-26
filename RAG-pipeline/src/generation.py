@@ -1,4 +1,5 @@
 import logging
+from html import escape
 from typing import List, Dict, Any, Iterator
 from groq import Groq
 from src.config import Config
@@ -11,10 +12,11 @@ class ProductionResponseGenerator:
     Injects retrieved multi-modal evidence contexts into XML blocks 
     and handles token streaming via Groq.
     """
-    def __init__(self):
+    def __init__(self, llm_client=None, model_name: str = None, api_key: str = None):
         # Establish the runtime link to the ultra-fast execution backend
-        self.llm_client = Groq(api_key=Config.GROQ_API_KEY)
-        self.model_name = "llama-3.3-70b-versatile"
+        resolved_key = Config.GROQ_API_KEY if api_key is None else api_key
+        self.llm_client = llm_client or (Groq(api_key=resolved_key) if resolved_key else None)
+        self.model_name = model_name or Config.GROQ_MODEL_NAME
 
     def _build_xml_context_prompt(self, query: str, context_pool: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         """Constructs a deterministic system and user prompt utilizing strict XML encapsulation."""
@@ -38,16 +40,16 @@ class ProductionResponseGenerator:
             relations = metadata.get("graph_context_relations", [])
             
             block = f'<document index="{idx}">\n'
-            block += f'  <chunk_id>{doc["chunk_id"]}</chunk_id>\n'
-            block += f'  <source_file>{metadata.get("source", "unknown")}</source_file>\n'
+            block += f'  <chunk_id>{escape(str(doc["chunk_id"]))}</chunk_id>\n'
+            block += f'  <source_file>{escape(str(metadata.get("source", "unknown")))}</source_file>\n'
             
             if relations:
-                block += f'  <discovered_knowledge_graph_paths>\n'
+                block += '  <discovered_knowledge_graph_paths>\n'
                 for rel in relations:
-                    block += f'    <path>{rel}</path>\n'
-                block += f'  </discovered_knowledge_graph_paths>\n'
+                    block += f'    <path>{escape(str(rel))}</path>\n'
+                block += '  </discovered_knowledge_graph_paths>\n'
                 
-            block += f'  <content>\n{doc["text"]}\n  </content>\n'
+            block += f'  <content>\n{escape(str(doc["text"]))}\n  </content>\n'
             block += '</document>\n'
             context_str_accumulator.append(block)
 
@@ -79,6 +81,8 @@ class ProductionResponseGenerator:
         messages = self._build_xml_context_prompt(query, viable_context)
 
         try:
+            if self.llm_client is None:
+                raise RuntimeError("GROQ_API_KEY is not configured")
             stream = self.llm_client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
@@ -93,4 +97,4 @@ class ProductionResponseGenerator:
                     
         except Exception as e:
             logger.error(f"Streaming token generation failure: {str(e)}")
-            yield f"\n[CRITICAL RUNTIME ERROR: Generation failed - {str(e)}]"
+            yield "\n[Generation is temporarily unavailable.]"

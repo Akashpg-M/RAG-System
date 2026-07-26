@@ -14,15 +14,16 @@ class CentralizedTokenizer:
     def __init__(self):
         self.token_pattern = re.compile(r'(?i)\bc\+\+\b|\b[a-z0-9]+(?:[-_.][a-z0-9]+)*\b')
         
-        # Safely download the NLTK stopword corpus if it hasn't been cached locally yet
         try:
             nltk.data.find('corpora/stopwords')
+            self.stopwords = set(stopwords.words('english'))
         except LookupError:
-            logger.info("Downloading NLTK stopwords corpus...")
-            nltk.download('stopwords', quiet=True)
-            
-        # Load the official, linguist-maintained English stopword set
-        self.stopwords = set(stopwords.words('english'))
+            logger.warning("NLTK stopwords corpus unavailable; using bundled fallback set")
+            self.stopwords = {
+                "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+                "has", "he", "in", "is", "it", "its", "of", "on", "that", "the",
+                "to", "was", "were", "will", "with",
+            }
         
         # You can programmatically add your own domain-specific noise words here
         self.stopwords.update({"example", "test", "dummy_variable"})

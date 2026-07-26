@@ -2,6 +2,7 @@ import queue
 import threading
 import logging
 import uuid
+import time
 from typing import Dict, Any, Optional
 from enum import Enum
 
@@ -24,6 +25,7 @@ class IngestionQueueManager:
         self.chunker = chunker
         self.task_states: Dict[str, Dict[str, Any]] = {}
         self.state_lock = threading.Lock()
+        self._stop_sentinel = object()
         
         # Spawn the continuous worker daemon thread
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
@@ -48,7 +50,21 @@ class IngestionQueueManager:
     def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
         """Thread-safe status checking for active ingestion tasks."""
         with self.state_lock:
-            return self.task_states.get(task_id)
+            state = self.task_states.get(task_id)
+            return state.copy() if state else None
+
+    def wait_for_task(self, task_id: str, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while deadline is None or time.monotonic() < deadline:
+            state = self.get_task_status(task_id)
+            if state is None or state["status"] in (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value):
+                return state
+            time.sleep(0.05)
+        return self.get_task_status(task_id)
+
+    def shutdown(self, timeout: float = 5.0):
+        self.task_queue.put(self._stop_sentinel)
+        self.worker_thread.join(timeout=timeout)
 
     def _update_status(self, task_id: str, status: TaskStatus, error: Optional[str] = None):
         with self.state_lock:
@@ -60,8 +76,11 @@ class IngestionQueueManager:
     def _worker_loop(self):
         """Infinite worker loop executing tasks sequentially in the background thread."""
         while True:
+            task = None
             try:
                 task = self.task_queue.get()
+                if task is self._stop_sentinel:
+                    return
                 task_id = task["task_id"]
                 file_path = task["file_path"]
                 
@@ -75,7 +94,10 @@ class IngestionQueueManager:
                 logger.info(f"Task {task_id} processed successfully.")
                 
             except Exception as e:
+                task_id = task.get("task_id") if isinstance(task, dict) else None
                 logger.error(f"Task processing failure on ID {task_id}: {str(e)}")
-                self._update_status(task_id, TaskStatus.FAILED, error=str(e))
+                if task_id:
+                    self._update_status(task_id, TaskStatus.FAILED, error=str(e))
             finally:
-                self.task_queue.task_done()
+                if task is not None:
+                    self.task_queue.task_done()

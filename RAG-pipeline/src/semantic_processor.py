@@ -11,13 +11,15 @@ class SemanticQueryProcessor:
     Decoupled Linguistic Synthesis Layer.
     Can be dynamically bypassed for local deterministic testing.
     """
-    def __init__(self, semantic_enabled: bool = True):
-        self.enabled = semantic_enabled
+    def __init__(self, semantic_enabled: bool = True, llm_client=None, model_name: str = None, api_key: str = None):
+        resolved_key = Config.GROQ_API_KEY if api_key is None else api_key
+        self.model_name = model_name or Config.GROQ_MODEL_NAME
+        self.enabled = semantic_enabled and bool(resolved_key or llm_client)
         self.llm_client = None
         
         if self.enabled:
             logger.info("Initializing Groq Semantic Processor Pipeline Link...")
-            self.llm_client = Groq(api_key=Config.GROQ_API_KEY)
+            self.llm_client = llm_client or Groq(api_key=resolved_key)
 
     def process_query(self, raw_query: str) -> Dict[str, Any]:
         """Generates rewritten and HyDE representations if semantic operations are enabled."""
@@ -37,7 +39,7 @@ class SemanticQueryProcessor:
         """
         try:
             response = self.llm_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=self.model_name,
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": raw_query}
