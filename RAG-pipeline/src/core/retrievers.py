@@ -6,6 +6,18 @@ from typing import Any, Dict, List, Optional
 from src.core.ports import CacheProvider, DenseIndex, EmbeddingProvider, GraphIndex, SparseIndex
 
 
+def candidate_matches(candidate: Dict[str, Any], filters: Optional[Dict[str, Any]]) -> bool:
+    if not filters:
+        return True
+    metadata = candidate.get("metadata", {})
+    document_id = candidate.get("document_id") or str(candidate.get("chunk_id", "")).split("#", 1)[0]
+    for key, value in filters.items():
+        actual = document_id if key == "document_id" else metadata.get(key)
+        if actual != value:
+            return False
+    return True
+
+
 class DenseRetriever:
     def __init__(self, vector_store: DenseIndex, embedder: EmbeddingProvider, cache: CacheProvider):
         self.store = vector_store
@@ -25,12 +37,13 @@ class DenseRetriever:
             query_vector = self.embedder.get_embeddings_batched([query])[0]
             self.cache.set(query_hash, query_vector)
         hits = self.store.search_similar(query_vector, limit=top_k, metadata_filter=filters)
-        return [{
+        candidates = [{
             "chunk_id": hit["chunk_id"], "text": hit["text"], "parent_id": hit.get("parent_id", ""),
             "metadata": hit.get("metadata", {}), "retriever": "dense",
             "dense_score": hit.get("score", 1.0), "sparse_score": None, "graph_score": None,
             "rrf_score": 0.0, "rerank_score": None,
         } for hit in hits]
+        return [candidate for candidate in candidates if candidate_matches(candidate, filters)]
 
 
 class SparseRetriever:
@@ -44,13 +57,17 @@ class SparseRetriever:
         filters: Optional[Dict[str, Any]] = None,
         context: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        hits = self.store.search(query, top_k=top_k)
-        return [{
+        try:
+            hits = self.store.search(query, top_k=top_k, metadata_filter=filters)
+        except TypeError:
+            hits = self.store.search(query, top_k=top_k)
+        candidates = [{
             "chunk_id": hit["chunk_id"], "text": hit["text"], "parent_id": hit.get("parent_id", ""),
             "metadata": hit.get("metadata", {}), "retriever": "sparse",
             "dense_score": None, "sparse_score": hit["sparse_score"], "graph_score": None,
             "rrf_score": 0.0, "rerank_score": None,
         } for hit in hits]
+        return [candidate for candidate in candidates if candidate_matches(candidate, filters)]
 
 
 class GraphRetriever:
@@ -107,6 +124,9 @@ class GraphRetriever:
                     "retriever": "graph", "dense_score": None, "sparse_score": None,
                     "graph_score": chunk_scores[identifier], "rrf_score": 0.0, "rerank_score": None,
                 })
+                if not candidate_matches(results[-1], filters):
+                    results.pop()
+                    continue
                 if len(results) >= top_k:
                     return results
         return results

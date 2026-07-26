@@ -11,8 +11,9 @@ select = ["E4", "E7", "E9", "F"]
 
 [tool.mypy]
 python_version = "3.10"
-files = ["src/core", "src/application/config.py"]
+files = ["src/core", "src/application/config.py", "src/api"]
 ignore_missing_imports = true
+follow_imports = "skip"
 check_untyped_defs = true
 no_implicit_optional = false
 warn_unused_ignores = true

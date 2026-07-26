@@ -62,6 +62,11 @@ class KnowledgeGraphStore:
             conn.execute("DELETE FROM triples WHERE chunk_id LIKE ?", (f"{document_id}#%",))
             conn.commit()
 
+    def is_ready(self) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("SELECT 1").fetchone()
+        return True
+
     def traverse_graph_hops(self, seed_entities: List[str], max_hops: int = 1) -> List[Dict[str, Any]]:
         if not seed_entities:
             return []

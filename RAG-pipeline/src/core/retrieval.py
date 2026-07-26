@@ -17,15 +17,23 @@ class RetrieverManager:
         self.enable_hyde = enable_hyde
 
     def execute_routing(
-        self, semantic_payload: Dict[str, Any], top_k: int = 10, filters: Optional[Dict[str, Any]] = None
+        self,
+        semantic_payload: Dict[str, Any],
+        top_k: int = 10,
+        filters: Optional[Dict[str, Any]] = None,
+        mode: str = "hybrid",
     ) -> List[List[Dict[str, Any]]]:
-        jobs = [
-            ("sparse", self.sparse, semantic_payload["original_query"]),
-            ("dense_rewrite", self.dense, semantic_payload["rewritten_query"]),
-        ]
-        if self.enable_hyde:
+        jobs = []
+        if mode in ("hybrid", "sparse"):
+            jobs.append(("sparse", self.sparse, semantic_payload["original_query"]))
+        if mode in ("hybrid", "dense"):
+            jobs.append(("dense_rewrite", self.dense, semantic_payload["rewritten_query"]))
+        if mode in ("hybrid", "dense") and self.enable_hyde:
             jobs.append(("dense_hyde", self.dense, semantic_payload["hyde_document"]))
-        jobs.append(("graph", self.graph, semantic_payload["original_query"]))
+        if mode in ("hybrid", "graph"):
+            jobs.append(("graph", self.graph, semantic_payload["original_query"]))
+        if not jobs:
+            raise ValueError(f"Unsupported retrieval mode: {mode}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as executor:
             futures = [(name, executor.submit(retriever.retrieve, query, top_k, filters)) for name, retriever, query in jobs]
             results = []
@@ -56,10 +64,16 @@ class RetrievalService:
         self.rerank_pool_multiplier = rerank_pool_multiplier
 
     def retrieve_context(
-        self, query_text: str, top_k: int = 5, filters: Optional[Dict[str, Any]] = None
+        self,
+        query_text: str,
+        top_k: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+        mode: str = "hybrid",
     ) -> List[Dict[str, Any]]:
         semantic_data = dict(self.processor.process_query(query_text))
-        matrices = self.manager.execute_routing(semantic_data, top_k=self.candidate_top_k, filters=filters)
+        matrices = self.manager.execute_routing(
+            semantic_data, top_k=max(self.candidate_top_k, top_k), filters=filters, mode=mode
+        )
         fused_pool = self.fusion.fuse(matrices)
         if not fused_pool:
             return []
@@ -75,4 +89,3 @@ class RetrievalService:
             candidate["rerank_score"] = float(score)
         candidate_pool.sort(key=lambda item: item["rerank_score"], reverse=True)
         return candidate_pool[:top_k]
-

@@ -19,6 +19,7 @@ from src.infrastructure.memory import (
     TokenOverlapReranker,
 )
 from src.infrastructure.repositories import LocalFileObjectStorage, SQLiteDocumentRepository, SQLiteTaskRepository
+from src.core.contracts import IndexingStatus, IngestionTask
 
 
 def test_core_has_no_infrastructure_specific_imports():
@@ -95,7 +96,21 @@ def test_local_and_memory_adapters_expose_core_port_operations(tmp_path):
         SQLiteEmbeddingCache(str(tmp_path / "cache.db")): ("get", "set"),
         LocalFileObjectStorage(): ("exists", "read_bytes", "delete"),
         SQLiteDocumentRepository(str(tmp_path / "documents.db")): ("save", "get_latest", "delete"),
-        SQLiteTaskRepository(str(tmp_path / "tasks.db")): ("save", "get"),
+        SQLiteTaskRepository(str(tmp_path / "tasks.db")): ("save", "get", "get_latest_for_document"),
     }
     for adapter, operations in adapters.items():
         assert all(callable(getattr(adapter, operation, None)) for operation in operations)
+
+
+def test_sqlite_task_repository_round_trips_versioned_lifecycle(tmp_path):
+    repository = SQLiteTaskRepository(str(tmp_path / "tasks.db"))
+    task = IngestionTask(
+        task_id="task", source_uri="source", document_id="document", version_id="version",
+        status=IndexingStatus.QUEUED, history=[IndexingStatus.UPLOADING, IndexingStatus.QUEUED],
+    )
+    repository.save(task)
+    loaded = repository.get("task")
+    assert loaded is not None
+    assert loaded.version_id == "version"
+    assert loaded.history == [IndexingStatus.UPLOADING, IndexingStatus.QUEUED]
+    assert repository.get_latest_for_document("document").task_id == "task"

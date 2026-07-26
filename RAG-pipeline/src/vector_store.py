@@ -143,3 +143,7 @@ class ProductionVectorStore:
                 points_selector=PointIdsList(points=point_ids),
                 wait=True,
             )
+
+    def is_ready(self) -> bool:
+        self.client.get_collections()
+        return True

@@ -10,6 +10,11 @@ from src.core.contracts import DocumentVersion, IndexingStatus, IngestionTask
 
 
 class LocalFileObjectStorage:
+    def put_bytes(self, uri: str, data: bytes, content_type: str) -> None:
+        path = Path(uri)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
     def exists(self, uri: str) -> bool:
         return Path(uri).is_file()
 
@@ -73,20 +78,30 @@ class SQLiteTaskRepository:
                     task_id TEXT PRIMARY KEY,
                     source_uri TEXT,
                     document_id TEXT,
+                    version_id TEXT,
                     status TEXT,
                     error TEXT,
                     created_at TEXT,
                     updated_at TEXT
+                    ,history TEXT
                 )
             """)
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(ingestion_tasks)")}
+            if "version_id" not in columns:
+                connection.execute("ALTER TABLE ingestion_tasks ADD COLUMN version_id TEXT")
+            if "history" not in columns:
+                connection.execute("ALTER TABLE ingestion_tasks ADD COLUMN history TEXT DEFAULT '[]'")
 
     def save(self, task: IngestionTask) -> None:
         with sqlite3.connect(self.db_path) as connection:
             connection.execute(
-                "INSERT OR REPLACE INTO ingestion_tasks VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO ingestion_tasks "
+                "(task_id, source_uri, document_id, version_id, status, error, created_at, updated_at, history) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    task.task_id, task.source_uri, task.document_id, task.status.value, task.error,
+                    task.task_id, task.source_uri, task.document_id, task.version_id, task.status.value, task.error,
                     task.created_at.isoformat(), task.updated_at.isoformat(),
+                    json.dumps([status.value for status in task.history]),
                 ),
             )
             connection.commit()
@@ -94,12 +109,21 @@ class SQLiteTaskRepository:
     def get(self, task_id: str) -> Optional[IngestionTask]:
         with sqlite3.connect(self.db_path) as connection:
             row = connection.execute(
-                "SELECT task_id, source_uri, document_id, status, error, created_at, updated_at "
+                "SELECT task_id, source_uri, document_id, version_id, status, error, created_at, updated_at, history "
                 "FROM ingestion_tasks WHERE task_id = ?", (task_id,),
             ).fetchone()
         if not row:
             return None
         return IngestionTask(
-            task_id=row[0], source_uri=row[1], document_id=row[2], status=IndexingStatus(row[3]), error=row[4],
-            created_at=datetime.fromisoformat(row[5]), updated_at=datetime.fromisoformat(row[6]),
+            task_id=row[0], source_uri=row[1], document_id=row[2], version_id=row[3],
+            status=IndexingStatus(row[4]), error=row[5], created_at=datetime.fromisoformat(row[6]),
+            updated_at=datetime.fromisoformat(row[7]), history=[IndexingStatus(value) for value in json.loads(row[8] or "[]")],
         )
+
+    def get_latest_for_document(self, document_id: str) -> Optional[IngestionTask]:
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT task_id FROM ingestion_tasks WHERE document_id = ? ORDER BY updated_at DESC LIMIT 1",
+                (document_id,),
+            ).fetchone()
+        return self.get(row[0]) if row else None

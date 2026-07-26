@@ -126,7 +126,9 @@ class SparseStore:
             conn.commit()
         self.recalculate_corpus_stats()
 
-    def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    def search(
+        self, query: str, top_k: int = 10, metadata_filter: Dict[str, Any] = None
+    ) -> List[Dict[str, Any]]:
         query_tokens = canonical_tokenizer.tokenize(query)
         if not query_tokens:
             return []
@@ -179,6 +181,16 @@ class SparseStore:
         for chunk_id, data in candidate_scores.items():
             if data["score"] > 0:
                 payload = data["payload"]
+                if metadata_filter:
+                    document_id = metadata_filter.get("document_id")
+                    if document_id and str(payload["chunk_id"]).split("#", 1)[0] != document_id:
+                        continue
+                    metadata = payload.get("metadata", {})
+                    if any(
+                        metadata.get(key) != value
+                        for key, value in metadata_filter.items() if key != "document_id"
+                    ):
+                        continue
                 payload["sparse_score"] = data["score"]
                 results.append(payload)
 
@@ -192,3 +204,8 @@ class SparseStore:
                 (identifier, identifier),
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def is_ready(self) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("SELECT 1").fetchone()
+        return True

@@ -4,6 +4,7 @@ import hashlib
 import math
 import re
 import uuid
+import threading
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
@@ -68,6 +69,9 @@ class InMemoryDenseIndex:
             chunk_id: value for chunk_id, value in self.points.items() if value[0].document_id != document_id
         }
 
+    def is_ready(self) -> bool:
+        return True
+
 
 class InMemorySparseIndex:
     def __init__(self):
@@ -80,10 +84,21 @@ class InMemorySparseIndex:
     def add_documents(self, chunks: List[ChildChunk]) -> None:
         self.documents.update((chunk.chunk_id, chunk) for chunk in chunks)
 
-    def search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    def search(
+        self, query: str, top_k: int = 10, metadata_filter: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         query_tokens = self._tokens(query)
         results = []
         for chunk in self.documents.values():
+            if metadata_filter:
+                document_id = metadata_filter.get("document_id")
+                if document_id and chunk.document_id != document_id:
+                    continue
+                if any(
+                    chunk.metadata.get(key) != value
+                    for key, value in metadata_filter.items() if key != "document_id"
+                ):
+                    continue
             document_tokens = self._tokens(chunk.text)
             score = float(sum(document_tokens.count(token) for token in query_tokens))
             if score:
@@ -101,6 +116,9 @@ class InMemorySparseIndex:
         for key in stale:
             del self.documents[key]
         return stale
+
+    def is_ready(self) -> bool:
+        return True
 
     @staticmethod
     def _payload(chunk: ChildChunk, **scores: Any) -> Dict[str, Any]:
@@ -145,6 +163,9 @@ class InMemoryGraphIndex:
 
     def delete_document(self, document_id: str) -> None:
         self.triples = [item for item in self.triples if not item["chunk_id"].startswith(f"{document_id}#")]
+
+    def is_ready(self) -> bool:
+        return True
 
 
 class PlainTextChunker:
@@ -214,6 +235,9 @@ class InMemoryObjectStorage:
     def exists(self, uri: str) -> bool:
         return uri in self.objects
 
+    def put_bytes(self, uri: str, data: bytes, content_type: str) -> None:
+        self.objects[uri] = bytes(data)
+
     def read_bytes(self, uri: str) -> bytes:
         return self.objects[uri]
 
@@ -224,26 +248,38 @@ class InMemoryObjectStorage:
 class InMemoryDocumentRepository:
     def __init__(self):
         self.versions: Dict[str, DocumentVersion] = {}
+        self.lock = threading.Lock()
 
     def save(self, version: DocumentVersion) -> None:
-        self.versions[version.document_id] = version
+        with self.lock:
+            self.versions[version.document_id] = version
 
     def get_latest(self, document_id: str) -> Optional[DocumentVersion]:
-        return self.versions.get(document_id)
+        with self.lock:
+            return self.versions.get(document_id)
 
     def delete(self, document_id: str) -> None:
-        self.versions.pop(document_id, None)
+        with self.lock:
+            self.versions.pop(document_id, None)
 
 
 class InMemoryTaskRepository:
     def __init__(self):
         self.tasks: Dict[str, IngestionTask] = {}
+        self.lock = threading.Lock()
 
     def save(self, task: IngestionTask) -> None:
-        self.tasks[task.task_id] = task
+        with self.lock:
+            self.tasks[task.task_id] = task
 
     def get(self, task_id: str) -> Optional[IngestionTask]:
-        return self.tasks.get(task_id)
+        with self.lock:
+            return self.tasks.get(task_id)
+
+    def get_latest_for_document(self, document_id: str) -> Optional[IngestionTask]:
+        with self.lock:
+            matching = [task for task in self.tasks.values() if task.document_id == document_id]
+            return max(matching, key=lambda task: task.updated_at) if matching else None
 
 
 class InMemoryQueue:
@@ -258,4 +294,3 @@ class InMemoryQueue:
     def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
         task = self.tasks.get(task_id)
         return task.copy() if task else None
-

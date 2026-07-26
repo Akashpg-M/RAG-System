@@ -14,3 +14,5 @@ htmlcov/
 qdrant_local_data/
 models/
 cache/
+uploaded_documents/
+uploads/

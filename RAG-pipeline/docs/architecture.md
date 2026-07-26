@@ -1,40 +1,54 @@
-# Modular RAG architecture
+# Modular RAG service architecture
 
 ## Dependency direction
 
 ```text
-entry points / future API / workers / evaluation
-                  |
-          application composition
-                  |
-       core services + contracts + ports
-                  ^
-                  |
- infrastructure adapters and model providers
+HTTP routes / CLI / future workers and evaluations
+                         |
+            API and application services
+                         |
+           core services, contracts, ports
+                         ^
+                         |
+       infrastructure adapters and providers
 ```
 
-`src/core` owns stable contracts, provider protocols, ingestion orchestration, retrieval routing, RRF, and retriever behavior. It imports no Qdrant, SQLite, Groq, SentenceTransformers, Docling, or NLTK modules.
+`src/core` owns shared contracts, provider protocols, ingestion orchestration, retrieval routing, RRF, and retriever behavior. It imports no Qdrant, SQLite, Groq, SentenceTransformers, Docling, NLTK, or FastAPI modules.
 
-`src/infrastructure` implements local adapters: Qdrant dense storage, SQLite sparse/graph/cache/repositories, the thread queue, SentenceTransformer embeddings, cross-encoder reranking, Groq query/generation, and deterministic in-memory substitutes.
+`src/application` validates profiles and wires the reusable RAG application. `src/api` adds HTTP schemas, lifecycle/query services, thin routes, authentication, validation, readiness, exception mapping, and metrics. Routes reference application services through `request.app.state`; they do not construct or import concrete indexes or model providers.
 
-`src/application` validates configuration and wires a complete application. `build_local_application` preserves the current local providers. `build_in_memory_application` provides a model-free, database-free offline application. Existing top-level modules remain compatibility facades for Stage 0 imports.
+`src/infrastructure` implements Qdrant, SQLite, local-file, background-thread, model-provider, and deterministic in-memory adapters. Historical top-level imports remain Stage 0 compatibility facades.
 
-## Core contracts and ports
+## HTTP control plane
 
-Contracts cover parent/child chunks, upload/deletion events, document versions, ingestion tasks and statuses, retrieval candidates, query results, and citations. Ports cover object storage, document/task repositories, queues, chunking, dense/sparse/graph indexes, embeddings, reranking, graph extraction, query processing, answer generation, caching, retrieval, and fusion.
+The versioned API exposes JSON queries, multipart uploads, task status, document deletion, liveness, readiness, and Prometheus metrics. Local upload bytes are validated before the object-storage port persists them. The request returns `202` after the task and document version are saved and background work is queued. The worker calls the existing `IngestionService`; it does not reproduce ingestion in the API layer.
 
-The ingestion service prepares graph and embedding artifacts, preserves cache ordering, and replaces document-owned records across all indexes. Retrieval runs sparse, rewritten dense, optional HyDE dense, and graph routes concurrently, then applies RRF and an injected reranker.
+API-assigned document and version IDs are injected into chunk metadata and used across dense, sparse, and graph indexes. This makes document filters, citations, status records, and deletion reference the same identity. Sparse filtering is applied before truncating ranked results, while all retrievers also enforce a common candidate filter.
 
-## Profiles
+## Lifecycle
 
-- `test`: in-memory indexes/cache/queue, deterministic embeddings/reranking/generation, no HyDE or graph extraction.
-- `local`: Qdrant, SQLite stores/cache, thread queue, SentenceTransformers, cross-encoder, and optional Groq.
-- `benchmark`: larger retrieval/batch limits with graph extraction and answer generation disabled.
-- `aws_demo`: validated placeholder selections and timeouts only. AWS adapters are intentionally not implemented in this stage.
+```text
+UPLOADING -> QUEUED -> PARSING -> CHUNKING -> EMBEDDING
+  -> INDEXING_DENSE -> INDEXING_SPARSE -> [INDEXING_GRAPH] -> READY
 
-Environment variables are read once by `load_config` at the application boundary. Core services receive configuration values and providers through constructors.
+active/ready/failure -> DELETE_PENDING -> DELETED
+active stage -> FAILED_RETRYABLE | FAILED_PERMANENT
+```
 
-## Future consumers
+Transitions are validated and persisted through `TaskRepository`. Status responses expose controlled error codes, never provider exception text. Per-document locks prevent a queued ingestion from returning a deleted document to `READY`.
 
-FastAPI handlers will call `RagApplication.ingest`, `delete`, and `query` without importing infrastructure. A process worker can consume upload/deletion event contracts and invoke `IngestionService`. Evaluation pipelines can inject deterministic or benchmark providers. Future AWS adapters will implement the existing ports and be selected in composition without changing core orchestration.
+## Security and operations
+
+Protected `/api/v1` routes use `X-API-Key` and a single-process sliding-window rate limiter. Upload validation enforces size, extension, MIME/signature agreement, safe filenames, UTF-8 text limits, PDF page/text limits, and DOCX archive limits. Validation and exception handlers return traceable errors without stack traces or raw input.
+
+`/health` is process-only. `/ready` runs bounded lightweight probes for configured mandatory indexes; optional graph/Groq capabilities do not block readiness when fallback behavior is enabled. `/metrics` uses normalized route templates and static status/method labels, never queries, filenames, IDs, or content.
+
+## Profiles and future adapters
+
+- `test`: deterministic in-memory RAG providers, local temporary object storage, and in-memory control repositories.
+- `local`: Qdrant, SQLite, local files, thread queues, SentenceTransformers, cross-encoder, and optional Groq.
+- `benchmark`: larger retrieval/batch settings with generation and graph extraction disabled.
+- `aws_demo`: validated placeholders only; AWS infrastructure remains deferred.
+
+Environment variables are read once at composition. A future API process, external worker, evaluator, or AWS adapter can implement existing ports without modifying route contracts or core orchestration.
 

@@ -90,7 +90,7 @@ def build_in_memory_application(
     )
 
 
-def build_local_application(config: AppConfig) -> RagApplication:
+def build_local_application(config: AppConfig, include_queue: bool = True) -> RagApplication:
     if config.profile is Profile.AWS_DEMO:
         raise NotImplementedError("AWS adapters are intentionally deferred; the profile only reserves validated settings")
 
@@ -150,11 +150,11 @@ def build_local_application(config: AppConfig) -> RagApplication:
     chunker = SemanticDoclingChunker(
         tiktoken.get_encoding("cl100k_base"), config.pipeline.chunk_size, config.pipeline.chunk_overlap
     )
-    queue = IngestionQueueManager(ingestion, chunker)
+    queue = IngestionQueueManager(ingestion, chunker) if include_queue else None
     return RagApplication(config, ingestion, retrieval, generator, chunker, queue)
 
 
-def build_application(config: AppConfig) -> RagApplication:
+def build_application(config: AppConfig, include_queue: bool = True) -> RagApplication:
     if config.providers.dense_index == "memory":
         return build_in_memory_application(config)
-    return build_local_application(config)
+    return build_local_application(config, include_queue=include_queue)

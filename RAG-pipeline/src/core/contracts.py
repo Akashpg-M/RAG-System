@@ -42,6 +42,18 @@ class RawDocument:
 
 
 class IndexingStatus(str, Enum):
+    UPLOADING = "UPLOADING"
+    QUEUED = "QUEUED"
+    PARSING = "PARSING"
+    CHUNKING = "CHUNKING"
+    EMBEDDING = "EMBEDDING"
+    INDEXING_DENSE = "INDEXING_DENSE"
+    INDEXING_SPARSE = "INDEXING_SPARSE"
+    INDEXING_GRAPH = "INDEXING_GRAPH"
+    READY = "READY"
+    DELETE_PENDING = "DELETE_PENDING"
+    FAILED_RETRYABLE = "FAILED_RETRYABLE"
+    FAILED_PERMANENT = "FAILED_PERMANENT"
     PENDING = "PENDING"
     PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
@@ -79,10 +91,12 @@ class IngestionTask:
     task_id: str
     source_uri: str
     document_id: Optional[str] = None
+    version_id: Optional[str] = None
     status: IndexingStatus = IndexingStatus.PENDING
     error: Optional[str] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    history: List[IndexingStatus] = field(default_factory=list)
 
 
 @dataclass
@@ -106,6 +120,8 @@ class RetrievalCandidate:
 class SourceCitation:
     chunk_id: str
     source_uri: str
+    document_id: str = ""
+    version_id: str = ""
     parent_id: str = ""
     title: Optional[str] = None
 

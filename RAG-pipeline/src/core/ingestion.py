@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 from src.core.contracts import Vector
 from src.core.ports import (
@@ -50,17 +50,39 @@ class IngestionService:
 
     def delete_document(self, source_uri: str) -> int:
         document_id = self.document_id_for(source_uri)
+        return self.delete_document_by_id(document_id)
+
+    def delete_document_by_id(self, document_id: str) -> int:
         chunk_ids = self.sparse_store.delete_document(document_id)
         self.graph_store.delete_document(document_id)
         self.vector_store.delete_document(document_id)
         return len(chunk_ids)
 
-    def ingest_document(self, source_uri: str, chunker: DocumentChunker) -> None:
+    def ingest_document(
+        self,
+        source_uri: str,
+        chunker: DocumentChunker,
+        document_id: Optional[str] = None,
+        version_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
         source_path = Path(source_uri).resolve()
         if not source_path.is_file():
             raise FileNotFoundError(f"Document does not exist: {source_uri}")
-        document_id = self.document_id_for(str(source_path))
-        parent_chunks, child_chunks = chunker.process_file(str(source_path), document_id)
+        resolved_document_id = document_id or self.document_id_for(str(source_path))
+        if progress_callback:
+            progress_callback("PARSING")
+        parent_chunks, child_chunks = chunker.process_file(str(source_path), resolved_document_id)
+        if progress_callback:
+            progress_callback("CHUNKING")
+        for parent in parent_chunks:
+            parent.metadata.setdefault("document_id", resolved_document_id)
+            if version_id:
+                parent.metadata.setdefault("version_id", version_id)
+        for child in child_chunks:
+            child.metadata.setdefault("document_id", resolved_document_id)
+            if version_id:
+                child.metadata.setdefault("version_id", version_id)
 
         triples = []
         if self.graph_extraction_enabled:
@@ -70,6 +92,8 @@ class IngestionService:
                     prepared["chunk_id"] = parent.parent_id
                     triples.append(prepared)
 
+        if progress_callback:
+            progress_callback("EMBEDDING")
         embeddings: List[Vector | None] = [None] * len(child_chunks)
         uncached_chunks = []
         uncached_positions = []
@@ -99,11 +123,17 @@ class IngestionService:
         if len(final_embeddings) != len(child_chunks):
             raise RuntimeError("Embedding preparation did not produce one vector per chunk")
 
-        self.sparse_store.delete_document(document_id)
-        self.graph_store.delete_document(document_id)
-        self.vector_store.delete_document(document_id)
+        self.sparse_store.delete_document(resolved_document_id)
+        self.graph_store.delete_document(resolved_document_id)
+        self.vector_store.delete_document(resolved_document_id)
         if child_chunks:
+            if progress_callback:
+                progress_callback("INDEXING_DENSE")
             self.vector_store.upsert_chunks_bulk(child_chunks, final_embeddings)
+            if progress_callback:
+                progress_callback("INDEXING_SPARSE")
             self.sparse_store.add_documents(child_chunks)
         if triples:
+            if progress_callback:
+                progress_callback("INDEXING_GRAPH")
             self.graph_store.add_triples_bulk(triples)
