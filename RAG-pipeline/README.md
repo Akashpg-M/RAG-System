@@ -89,11 +89,13 @@ The first local start may download Docling and SentenceTransformer/cross-encoder
 
 ### Durable ingestion worker
 
-Stage 3 runs upload ingestion outside the API. Start Redis, the API, and one or more
+Stage 4 runs upload ingestion outside the API and uses PostgreSQL as the publication
+visibility boundary. Start PostgreSQL, Redis, Qdrant, the API, and one or more
 workers in separate terminals:
 
 ```powershell
-docker compose up -d redis
+docker compose up -d postgres redis qdrant
+python -m alembic upgrade head
 python -m src.api
 python -m src.worker
 ```
@@ -104,6 +106,19 @@ recover abandoned pending entries, renew persistent leases, use scheduled delaye
 retries, and route terminal failures to a separate DLQ stream. Set
 `INGESTION_QUEUE_BACKEND=sqs`, `SQS_QUEUE_URL`, and `SQS_DLQ_URL` to select SQS Standard.
 SQS infrastructure provisioning and live-AWS tests are intentionally deferred.
+
+Every upload creates an immutable document version. Workers write version-qualified
+chunks to dense, sparse, and graph staging records, persist a provenance manifest and
+per-index results, and then atomically change the active version in PostgreSQL. Queries
+capture a corpus revision and discard candidates that are not active in that snapshot or
+belong to tombstoned documents. Graph indexing is optional by default; set
+`GRAPH_INDEX_REQUIRED=true` to make graph failure block publication. Query responses
+expose `publication_revision`, `graph_index_required`, and `publication_degraded`.
+
+Deletion writes a PostgreSQL tombstone before physical cleanup. Previous validated
+versions are retained for rollback according to `PUBLICATION_RETENTION_VERSIONS`; cleanup and
+reconciliation are application services and never restore query visibility after a
+physical-deletion failure.
 
 ## API endpoints
 

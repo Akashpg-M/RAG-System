@@ -8,10 +8,12 @@ import threading
 from src.application.composition import build_application
 from src.application.config import Profile, load_config
 from src.application.ingestion_runtime import IngestionWorker
+from src.application.publication_services import CleanupService
 from src.infrastructure.ingestion_queues import RedisStreamsQueue, SQSQueue
 from src.infrastructure.repositories import (
     LocalFileObjectStorage, SQLiteDocumentRepository, SQLiteLeaseRepository, SQLiteTaskRepository,
 )
+from src.infrastructure.publication import SQLitePublicationRepository
 
 
 def build_worker() -> IngestionWorker:
@@ -28,16 +30,29 @@ def build_worker() -> IngestionWorker:
                          config.queue.visibility_timeout_seconds, config.queue.capacity)
     else:
         raise ValueError("standalone worker requires redis or sqs queue backend")
-    tasks = SQLiteTaskRepository(config.storage.control_db_path)
+    if config.providers.task_repository == "sqlite":
+        tasks = SQLiteTaskRepository(config.storage.control_db_path)
+        documents = SQLiteDocumentRepository(config.storage.control_db_path)
+        leases = SQLiteLeaseRepository(config.storage.control_db_path)
+        publication = SQLitePublicationRepository(
+            config.storage.control_db_path, config.publication.retention_versions
+        )
+    else:
+        from src.infrastructure.postgres import PostgresControlPlane
+        tasks = documents = leases = publication = PostgresControlPlane(
+            config.storage.control_database_url, config.publication.retention_versions
+        )
+    storage = LocalFileObjectStorage()
+    cleanup = CleanupService(publication, documents, storage, application.ingestion)
     return IngestionWorker(
-        queue, tasks, SQLiteDocumentRepository(config.storage.control_db_path),
-        SQLiteLeaseRepository(config.storage.control_db_path), LocalFileObjectStorage(), application,
+        queue, tasks, documents, leases, storage, application,
         config.queue.worker_id, config.queue.max_concurrency, config.queue.poll_timeout_seconds,
         config.queue.lease_duration_seconds,
         min(config.queue.heartbeat_interval_seconds, config.queue.visibility_heartbeat_seconds)
         if config.queue.backend == "sqs" else config.queue.heartbeat_interval_seconds,
         config.queue.max_attempts, config.queue.retry_min_seconds, config.queue.retry_max_seconds,
         config.queue.shutdown_timeout_seconds,
+        publication, config.pipeline.graph_index_required, cleanup.run_once,
     )
 
 

@@ -81,6 +81,27 @@ class SparseStore:
         self.recalculate_corpus_stats()
         return chunk_ids
 
+    def delete_version(self, document_id: str, version_id: str) -> List[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT chunk_id,payload FROM documents WHERE document_id=?", (document_id,)).fetchall()
+            chunk_ids = [chunk_id for chunk_id, payload in rows
+                         if json.loads(payload).get("metadata", {}).get("version_id") == version_id]
+            if chunk_ids:
+                placeholders = ",".join("?" for _ in chunk_ids)
+                conn.execute(f"DELETE FROM postings WHERE chunk_id IN ({placeholders})", chunk_ids)
+                conn.execute(f"DELETE FROM documents WHERE chunk_id IN ({placeholders})", chunk_ids)
+                conn.commit()
+        self.recalculate_corpus_stats()
+        return chunk_ids
+
+    def version_chunks(self, document_id: str, version_id: str) -> Dict[str, str]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT chunk_id,payload,content_hash FROM documents WHERE document_id=?", (document_id,)
+            ).fetchall()
+        return {chunk_id: content_hash for chunk_id, payload, content_hash in rows
+                if json.loads(payload).get("metadata", {}).get("version_id") == version_id}
+
     def recalculate_corpus_stats(self):
         """Pre-computes and caches corpus metrics to completely eliminate real-time table scans."""
         with sqlite3.connect(self.db_path) as conn:

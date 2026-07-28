@@ -73,6 +73,9 @@ class QueryResponse(BaseModel):
     trace_id: str
     empty_context: bool
     refused: bool
+    publication_revision: Optional[int] = None
+    graph_index_required: bool = False
+    publication_degraded: bool = False
 
 
 class UploadResponse(BaseModel):

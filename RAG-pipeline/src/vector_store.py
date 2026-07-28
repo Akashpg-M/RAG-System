@@ -14,9 +14,9 @@ def qdrant_point_id(chunk_id: str) -> int:
     return int(digest[:15], 16)
 
 class ProductionVectorStore:
-    def __init__(self, collection_name: str, vector_dim: int, storage_path: str = None):
+    def __init__(self, collection_name: str, vector_dim: int, storage_path: str = None, url: str = None):
         self.collection_name = collection_name
-        self.client = QdrantClient(path=storage_path or Config.QDRANT_STORAGE_PATH)
+        self.client = QdrantClient(url=url) if url else QdrantClient(path=storage_path or Config.QDRANT_STORAGE_PATH)
         self._ensure_collection(vector_dim)
 
     def _ensure_collection(self, vector_dim: int):
@@ -143,6 +143,32 @@ class ProductionVectorStore:
                 points_selector=PointIdsList(points=point_ids),
                 wait=True,
             )
+
+    def delete_version(self, document_id: str, version_id: str):
+        query_filter = Filter(must=[
+            FieldCondition(key="document_id", match=MatchValue(value=document_id)),
+            FieldCondition(key="version_id", match=MatchValue(value=version_id)),
+        ])
+        self.client.delete(collection_name=self.collection_name, points_selector=query_filter, wait=True)
+
+    def version_chunks(self, document_id: str, version_id: str) -> Dict[str, str]:
+        query_filter = Filter(must=[
+            FieldCondition(key="document_id", match=MatchValue(value=document_id)),
+            FieldCondition(key="version_id", match=MatchValue(value=version_id)),
+        ])
+        chunks = {}
+        offset = None
+        while True:
+            records, offset = self.client.scroll(
+                collection_name=self.collection_name, scroll_filter=query_filter, limit=256, offset=offset,
+                with_payload=True, with_vectors=False,
+            )
+            for record in records:
+                payload = record.payload or {}
+                if payload.get("chunk_id") and payload.get("content_hash"):
+                    chunks[str(payload["chunk_id"])] = str(payload["content_hash"])
+            if offset is None:
+                return chunks
 
     def is_ready(self) -> bool:
         self.client.get_collections()

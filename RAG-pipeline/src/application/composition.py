@@ -108,12 +108,18 @@ def build_local_application(config: AppConfig, include_queue: bool = True) -> Ra
     from src.infrastructure.storage import KnowledgeGraphStore, ProductionVectorStore, SparseStore
     from src.tokenizer import canonical_tokenizer
 
-    graph_index = KnowledgeGraphStore(config.storage.graph_db_path)
+    if config.providers.graph_index == "postgres":
+        from src.infrastructure.postgres import PostgresGraphIndex
+        graph_index = PostgresGraphIndex(config.storage.control_database_url, config.publication.namespace)
+    else:
+        graph_index = KnowledgeGraphStore(config.storage.graph_db_path)
     sparse_index = SparseStore(config.storage.sparse_db_path)
     embedder = ProductionEmbedder(config.models.embedding_model)
     cache = SQLiteEmbeddingCache(config.storage.cache_db_path)
     dense_index = ProductionVectorStore(
-        config.storage.collection_name, embedder.vector_dim, storage_path=config.storage.qdrant_path
+        config.storage.collection_name, embedder.vector_dim,
+        storage_path=None if config.storage.qdrant_url else config.storage.qdrant_path,
+        url=config.storage.qdrant_url or None,
     )
     client = Groq(api_key=config.models.groq_api_key) if config.models.groq_api_key else None
     ontology_root = Path(__file__).resolve().parents[1] / "graph" / "ontologies"

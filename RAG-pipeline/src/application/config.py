@@ -20,7 +20,7 @@ class ProviderSettings(BaseModel):
     model_config = ConfigDict(frozen=True)
     dense_index: str = "qdrant"
     sparse_index: str = "sqlite"
-    graph_index: str = "sqlite"
+    graph_index: str = "postgres"
     embeddings: str = "sentence_transformer"
     reranker: str = "cross_encoder"
     query_processor: str = "groq"
@@ -28,19 +28,21 @@ class ProviderSettings(BaseModel):
     cache: str = "sqlite"
     queue: str = "redis"
     object_storage: str = "local"
-    document_repository: str = "sqlite"
-    task_repository: str = "sqlite"
+    document_repository: str = "postgres"
+    task_repository: str = "postgres"
 
 
 class StorageSettings(BaseModel):
     model_config = ConfigDict(frozen=True)
     qdrant_path: str = "./qdrant_local_data"
+    qdrant_url: str = "http://127.0.0.1:6333"
     sparse_db_path: str = "./sparse_index.db"
     graph_db_path: str = "./graph_store.db"
     cache_db_path: str = "./embedding_cache.db"
     collection_name: str = "enterprise_kb"
     upload_path: str = "./uploaded_documents"
     control_db_path: str = "./control_plane.db"
+    control_database_url: str = "postgresql://rag:rag-local-only@127.0.0.1:5432/rag_control"
 
 
 class ModelSettings(BaseModel):
@@ -65,6 +67,11 @@ class PipelineSettings(BaseModel):
     enable_hyde: bool = True
     enable_graph_extraction: bool = True
     enable_generation: bool = True
+    graph_index_required: bool = False
+    pipeline_version: str = "stage-4"
+    parser_version: str = "docling-2"
+    chunker_config_version: str = "semantic-v1"
+    index_schema_version: str = "multi-index-v1"
 
     @model_validator(mode="after")
     def validate_chunk_window(self) -> "PipelineSettings":
@@ -136,6 +143,14 @@ class QueueSettings(BaseModel):
         return self
 
 
+class PublicationSettings(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    retention_versions: int = Field(default=2, ge=1, le=100)
+    namespace: str = "default"
+    reconciliation_candidate_multiplier: int = Field(default=4, ge=1, le=20)
+    staging_abandon_seconds: int = Field(default=3600, gt=0)
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
     profile: Profile = Profile.LOCAL
@@ -145,6 +160,7 @@ class AppConfig(BaseModel):
     pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
     api: ApiSettings = Field(default_factory=ApiSettings)
     queue: QueueSettings = Field(default_factory=QueueSettings)
+    publication: PublicationSettings = Field(default_factory=PublicationSettings)
 
 
 def profile_config(profile: Profile | str, root: Optional[Path] = None) -> AppConfig:
@@ -196,11 +212,13 @@ def load_config(profile: Profile | str = Profile.LOCAL, environ: Optional[Mappin
     storage = StorageSettings(**{
             **base.storage.model_dump(),
             "qdrant_path": values.get("QDRANT_STORAGE_PATH", base.storage.qdrant_path),
+            "qdrant_url": values.get("QDRANT_URL", base.storage.qdrant_url),
             "sparse_db_path": values.get("SPARSE_DB_PATH", base.storage.sparse_db_path),
             "graph_db_path": values.get("GRAPH_DB_PATH", base.storage.graph_db_path),
             "cache_db_path": values.get("EMBEDDING_CACHE_PATH", base.storage.cache_db_path),
             "upload_path": values.get("UPLOAD_PATH", base.storage.upload_path),
             "control_db_path": values.get("CONTROL_DB_PATH", base.storage.control_db_path),
+            "control_database_url": values.get("CONTROL_DATABASE_URL", base.storage.control_database_url),
         })
     models = ModelSettings(**{
             **base.models.model_dump(),
@@ -213,6 +231,9 @@ def load_config(profile: Profile | str = Profile.LOCAL, environ: Optional[Mappin
             **base.pipeline.model_dump(),
             "chunk_size": int(values.get("CHUNK_SIZE", base.pipeline.chunk_size)),
             "chunk_overlap": int(values.get("CHUNK_OVERLAP", base.pipeline.chunk_overlap)),
+            "graph_index_required": values.get(
+                "GRAPH_INDEX_REQUIRED", str(base.pipeline.graph_index_required)
+            ).lower() in ("1", "true", "yes"),
         })
     api = ApiSettings(**{
         **base.api.model_dump(),
@@ -238,7 +259,18 @@ def load_config(profile: Profile | str = Profile.LOCAL, environ: Optional[Mappin
         "sqs_queue_url": values.get("SQS_QUEUE_URL", base.queue.sqs_queue_url),
         "sqs_dlq_url": values.get("SQS_DLQ_URL", base.queue.sqs_dlq_url),
     })
+    publication = PublicationSettings(**{
+        **base.publication.model_dump(),
+        "retention_versions": int(values.get(
+            "PUBLICATION_RETENTION_VERSIONS", base.publication.retention_versions
+        )),
+        "namespace": values.get("PUBLICATION_NAMESPACE", base.publication.namespace),
+        "staging_abandon_seconds": int(values.get(
+            "STAGING_ABANDON_SECONDS", base.publication.staging_abandon_seconds
+        )),
+    })
     return AppConfig(
         profile=base.profile, providers=base.providers, storage=storage, models=models, pipeline=pipeline, api=api,
         queue=queue,
+        publication=publication,
     )

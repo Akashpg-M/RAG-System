@@ -16,7 +16,8 @@ def normalized_route(path: str) -> str:
 
 
 class ApiMetrics:
-    def __init__(self, queue_depth: Callable[[], int], queue_stats: Optional[Callable[[], Any]] = None):
+    def __init__(self, queue_depth: Callable[[], int], queue_stats: Optional[Callable[[], Any]] = None,
+                 publication_stats: Optional[Callable[[], Any]] = None):
         self._lock = threading.Lock()
         self._request_counts: DefaultDict[Tuple[str, str, str], int] = defaultdict(int)
         self._request_latency_sum: DefaultDict[Tuple[str, str], float] = defaultdict(float)
@@ -24,6 +25,7 @@ class ApiMetrics:
         self._counters: DefaultDict[str, int] = defaultdict(int)
         self._queue_depth = queue_depth
         self._queue_stats = queue_stats
+        self._publication_stats = publication_stats
 
     def record_request(self, route: str, method: str, status_code: int, seconds: float) -> None:
         route = normalized_route(route)
@@ -73,6 +75,11 @@ class ApiMetrics:
         oldest = getattr(stats, "oldest_age_seconds", None) or 0
         retries = getattr(stats, "retries", 0)
         dlq = getattr(stats, "dlq", 0)
+        try:
+            publication = self._publication_stats() if self._publication_stats else {}
+        except Exception:
+            publication = {}
+        stage_durations = publication.get("stage_durations", {})
         lines.extend([
             "# HELP rag_ingestion_queue_depth Current durable ingestion queue depth.",
             "# TYPE rag_ingestion_queue_depth gauge",
@@ -107,5 +114,41 @@ class ApiMetrics:
             "# HELP rag_ingestion_active Current active ingestion count.",
             "# TYPE rag_ingestion_active gauge",
             "rag_ingestion_active 0",
+            "# HELP rag_version_publication_attempts_total Version publication attempts.",
+            "# TYPE rag_version_publication_attempts_total counter",
+            f'rag_version_publication_attempts_total {publication.get("activations", 0)}',
+            "# HELP rag_version_publications_total Version publications by bounded outcome.",
+            "# TYPE rag_version_publications_total counter",
+            f'rag_version_publications_total{{outcome="success"}} {publication.get("activations", 0)}',
+            'rag_version_publications_total{outcome="failure"} 0',
+            "# HELP rag_publication_validation_failures_total Publication validation failures.",
+            "# TYPE rag_publication_validation_failures_total counter",
+            "rag_publication_validation_failures_total 0",
+            "# HELP rag_index_stage_duration_seconds Index-stage duration by bounded index name.",
+            "# TYPE rag_index_stage_duration_seconds summary",
+            f'rag_index_stage_duration_seconds_sum{{index="dense"}} {stage_durations.get("dense", 0)}',
+            f'rag_index_stage_duration_seconds_sum{{index="sparse"}} {stage_durations.get("sparse", 0)}',
+            f'rag_index_stage_duration_seconds_sum{{index="graph"}} {stage_durations.get("graph", 0)}',
+            "# HELP rag_rollbacks_total Successful publication rollbacks.",
+            "# TYPE rag_rollbacks_total counter",
+            f'rag_rollbacks_total {publication.get("rollbacks", 0)}',
+            "# HELP rag_tombstoned_documents Current tombstoned document count.",
+            "# TYPE rag_tombstoned_documents gauge",
+            f'rag_tombstoned_documents {publication.get("tombstones", 0)}',
+            "# HELP rag_cleanup_jobs_total Cleanup jobs by bounded outcome.",
+            "# TYPE rag_cleanup_jobs_total counter",
+            'rag_cleanup_jobs_total{outcome="success"} 0',
+            'rag_cleanup_jobs_total{outcome="failure"} 0',
+            "# HELP rag_reconciliation_discrepancies Reconciliation discrepancies by bounded kind.",
+            "# TYPE rag_reconciliation_discrepancies gauge",
+            'rag_reconciliation_discrepancies{kind="missing"} 0',
+            'rag_reconciliation_discrepancies{kind="orphaned"} 0',
+            'rag_reconciliation_discrepancies{kind="checksum"} 0',
+            "# HELP rag_staging_version_age_seconds Age of the oldest staging version.",
+            "# TYPE rag_staging_version_age_seconds gauge",
+            f'rag_staging_version_age_seconds {publication.get("staging_age", 0)}',
+            "# HELP rag_retired_versions_awaiting_cleanup Retired versions awaiting cleanup.",
+            "# TYPE rag_retired_versions_awaiting_cleanup gauge",
+            f'rag_retired_versions_awaiting_cleanup {publication.get("retired", 0)}',
         ])
         return "\n".join(lines) + "\n"

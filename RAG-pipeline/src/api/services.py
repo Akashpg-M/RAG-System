@@ -103,10 +103,20 @@ class MetadataChunker:
 
     def process_file(self, file_path: str, document_id: str):
         parents, children = self.wrapped.process_file(file_path, document_id)
+        version_id = self.metadata.get("version_id")
+        if version_id:
+            parent_ids = {parent.parent_id: f"{document_id}#{version_id}#{parent.parent_id.split('#')[-1]}"
+                          for parent in parents}
+            for parent in parents:
+                parent.parent_id = parent_ids[parent.parent_id]
+            for child in children:
+                child.chunk_id = f"{document_id}#{version_id}#{child.chunk_id.split('#')[-1]}"
+                child.parent_id = parent_ids.get(child.parent_id, child.parent_id)
         for parent in parents:
             parent.metadata.update(self.metadata)
         for child in children:
             child.metadata.update(self.metadata)
+            child.metadata["parent_id"] = child.parent_id
         return parents, children
 
 
@@ -121,6 +131,7 @@ class DocumentControlService:
         queue: IngestionQueue,
         metrics: ApiMetrics,
         outbox: Optional[OutboxDispatcher] = None,
+        publication: Any = None,
     ):
         self.application = application
         self.config = config
@@ -130,6 +141,7 @@ class DocumentControlService:
         self.queue = queue
         self.metrics = metrics
         self.outbox = outbox
+        self.publication = publication
         self.validator = UploadValidator(config.api)
         self.lifecycle = LifecycleController(tasks)
         self._document_locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
@@ -148,10 +160,12 @@ class DocumentControlService:
         if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", document_id):
             raise ApiError(422, "invalid_document_id", "document_id must contain 8 to 128 safe characters")
         content_hash = hashlib.sha256(data).hexdigest()
-        version_id = hashlib.sha256(f"{document_id}\0{content_hash}".encode("utf-8")).hexdigest()[:16]
+        version_id = hashlib.sha256(
+            f"{document_id}\0{content_hash}\0{self.config.pipeline.pipeline_version}".encode("utf-8")
+        ).hexdigest()[:16]
         source_uri = str(Path(self.config.storage.upload_path).resolve() / document_id / version_id / safe_name)
         namespace = "local"
-        pipeline_version = self.config.api.config_version
+        pipeline_version = self.config.pipeline.pipeline_version
         key = idempotency_key(namespace, source_uri, content_hash, pipeline_version)
         find_existing = getattr(self.tasks, "get_by_idempotency_key", None)
         existing = find_existing(key) if find_existing else None
@@ -176,10 +190,22 @@ class DocumentControlService:
 
         version_metadata: Dict[str, Any] = {
             "filename": safe_name, "content_type": content_type, "status": IndexingStatus.QUEUED.value,
+            "namespace": self.config.publication.namespace,
+            "source_version": content_hash,
+            "pipeline_version": self.config.pipeline.pipeline_version,
+            "parser_version": self.config.pipeline.parser_version,
+            "chunker_config_version": (
+                f"{self.config.pipeline.chunker_config_version}:"
+                f"{self.config.pipeline.chunk_size}:{self.config.pipeline.chunk_overlap}"
+            ),
+            "embedding_model_version": self.config.models.embedding_model,
+            "index_schema_version": self.config.pipeline.index_schema_version,
             **(metadata or {}),
         }
         version = DocumentVersion(document_id, version_id, source_uri, content_hash, now, version_metadata)
         self.documents.save(version)
+        if self.publication:
+            self.publication.register_version(document_id, version_id)
         task = replace(task, status=IndexingStatus.QUEUED, history=[IndexingStatus.UPLOADING, IndexingStatus.QUEUED],
                        updated_at=datetime.now(timezone.utc))
         task = replace(task, idempotency_key=key)
@@ -274,6 +300,20 @@ class DocumentControlService:
                 document_id=document_id, version_id=version.version_id, status=IndexingStatus.DELETED,
                 deleted_chunks=0, already_deleted=True,
             )
+        if self.publication:
+            _, created = self.publication.tombstone(document_id)
+            task = self.tasks.get_latest_for_document(document_id)
+            if task and task.status not in (IndexingStatus.DELETE_PENDING, IndexingStatus.DELETED):
+                self.lifecycle.transition(task.task_id, IndexingStatus.DELETE_PENDING)
+                self.lifecycle.transition(task.task_id, IndexingStatus.DELETED)
+            deleted = 0
+            if self.config.profile.value == "test":
+                deleted = self.application.ingestion.delete_document_by_id(document_id)
+                self.storage.delete(version.source_uri)
+            return DeleteResponse(
+                document_id=document_id, version_id=version.version_id, status=IndexingStatus.DELETED,
+                deleted_chunks=deleted, already_deleted=not created,
+            )
         pending = replace(version, metadata={**version.metadata, "status": IndexingStatus.DELETE_PENDING.value})
         self.documents.save(pending)
         task = self.tasks.get_latest_for_document(document_id)
@@ -301,11 +341,13 @@ class DocumentControlService:
 
 
 class QueryApplicationService:
-    def __init__(self, application: RagApplication, config: AppConfig, documents: DocumentRepository, metrics: ApiMetrics):
+    def __init__(self, application: RagApplication, config: AppConfig, documents: DocumentRepository, metrics: ApiMetrics,
+                 publication: Any = None):
         self.application = application
         self.config = config
         self.documents = documents
         self.metrics = metrics
+        self.publication = publication
 
     def execute(self, request: QueryRequest, trace_id: str) -> QueryResponse:
         if request.stream:
@@ -323,10 +365,32 @@ class QueryApplicationService:
                 raise ApiError(422, "filter_not_allowed", "One or more metadata filter fields are not allowed")
             filters.update(request.filters.metadata)
         self.metrics.increment("queries_total")
+        snapshot = None
         try:
-            context = self.application.retrieval.retrieve_context(
-                request.query, top_k=request.top_k, filters=filters or None, mode=request.retrieval_mode.value
+            snapshot = self.publication.snapshot() if self.publication else None
+            candidate_count = request.top_k * (
+                self.config.publication.reconciliation_candidate_multiplier if snapshot else 1
             )
+            context = self.application.retrieval.retrieve_context(
+                request.query, top_k=candidate_count, filters=filters or None, mode=request.retrieval_mode.value
+            )
+            if snapshot:
+                approved = []
+                for candidate in context:
+                    metadata = candidate.get("metadata", {})
+                    candidate_document = str(metadata.get("document_id") or candidate.get("document_id") or
+                                             str(candidate.get("chunk_id", "")).split("#", 1)[0])
+                    candidate_version = str(metadata.get("version_id", ""))
+                    namespace = str(metadata.get("namespace", "default"))
+                    if filters.get("document_id") and candidate_document != filters["document_id"]:
+                        continue
+                    if any(metadata.get(key) != value for key, value in filters.items() if key != "document_id"):
+                        continue
+                    if namespace == self.config.publication.namespace and snapshot.allows(
+                        candidate_document, candidate_version, namespace
+                    ):
+                        approved.append(candidate)
+                context = approved[:request.top_k]
         except Exception as error:
             self.metrics.increment("query_failures_total")
             raise ApiError(503, "query_failed", "Query processing is temporarily unavailable") from error
@@ -337,6 +401,8 @@ class QueryApplicationService:
                 retrieval_strategy=request.retrieval_mode.value, sources=[], model_version=self.config.models.groq_model,
                 configuration_version=self.config.api.config_version, trace_id=trace_id,
                 empty_context=True, refused=True,
+                publication_revision=snapshot.revision if snapshot else None,
+                graph_index_required=self.config.pipeline.graph_index_required,
             )
         try:
             answer = "".join(self.application.generator.generate_stream(request.query, context))
@@ -344,16 +410,24 @@ class QueryApplicationService:
             self.metrics.increment("query_failures_total")
             raise ApiError(503, "generation_failed", "Answer generation is temporarily unavailable") from error
         sources = [self._source(candidate) for candidate in context]
+        degraded = bool(snapshot and any(
+            (source.document_id, source.version_id) in snapshot.degraded_versions for source in sources
+        ))
         return QueryResponse(
             answer=answer, retrieval_strategy=request.retrieval_mode.value, sources=sources,
             model_version=self.config.models.groq_model, configuration_version=self.config.api.config_version,
             trace_id=trace_id, empty_context=False, refused=False,
+            publication_revision=snapshot.revision if snapshot else None,
+            graph_index_required=self.config.pipeline.graph_index_required,
+            publication_degraded=degraded,
         )
 
     def _source(self, candidate: Dict[str, Any]) -> SourceResponse:
         metadata = candidate.get("metadata", {})
         document_id = metadata.get("document_id") or str(candidate["chunk_id"]).split("#", 1)[0]
-        version = self.documents.get_latest(str(document_id))
+        get_version = getattr(self.documents, "get_version", None)
+        version = get_version(str(document_id), str(metadata.get("version_id"))) if get_version and metadata.get("version_id") \
+            else self.documents.get_latest(str(document_id))
         version_id = metadata.get("version_id") or (version.version_id if version else "unversioned")
         filename = version.metadata.get("filename", "indexed-document") if version else "indexed-document"
         excerpt = str(candidate["text"])[:self.config.api.excerpt_characters]

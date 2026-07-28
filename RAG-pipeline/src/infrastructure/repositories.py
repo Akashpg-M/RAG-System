@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
@@ -46,8 +47,18 @@ class SQLiteDocumentRepository:
 
     def save(self, version: DocumentVersion) -> None:
         with sqlite3.connect(self.db_path) as connection:
+            existing = connection.execute(
+                "SELECT source_uri,content_hash,created_at,metadata FROM document_versions "
+                "WHERE document_id=? AND version_id=?", (version.document_id, version.version_id),
+            ).fetchone()
+            if existing:
+                expected = (version.source_uri, version.content_hash, version.created_at.isoformat(),
+                            json.dumps(version.metadata))
+                if existing != expected:
+                    raise ValueError("document versions are immutable")
+                return
             connection.execute(
-                "INSERT OR REPLACE INTO document_versions VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO document_versions VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     version.document_id, version.version_id, version.source_uri, version.content_hash,
                     version.created_at.isoformat(), json.dumps(version.metadata),
@@ -65,6 +76,24 @@ class SQLiteDocumentRepository:
         if not row:
             return None
         return DocumentVersion(row[0], row[1], row[2], row[3], datetime.fromisoformat(row[4]), json.loads(row[5]))
+
+    def get_version(self, document_id: str, version_id: str) -> Optional[DocumentVersion]:
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT document_id,version_id,source_uri,content_hash,created_at,metadata FROM document_versions "
+                "WHERE document_id=? AND version_id=?", (document_id, version_id),
+            ).fetchone()
+        return DocumentVersion(row[0], row[1], row[2], row[3], datetime.fromisoformat(row[4]), json.loads(row[5])) \
+            if row else None
+
+    def list_versions(self, document_id: str) -> list[DocumentVersion]:
+        with sqlite3.connect(self.db_path) as connection:
+            rows = connection.execute(
+                "SELECT document_id,version_id,source_uri,content_hash,created_at,metadata FROM document_versions "
+                "WHERE document_id=? ORDER BY created_at", (document_id,),
+            ).fetchall()
+        return [DocumentVersion(row[0], row[1], row[2], row[3], datetime.fromisoformat(row[4]), json.loads(row[5]))
+                for row in rows]
 
     def delete(self, document_id: str) -> None:
         with sqlite3.connect(self.db_path) as connection:
@@ -297,8 +326,8 @@ class SQLiteLeaseRepository:
     def release(self, resource_id: str, token: str, fencing: int) -> bool:
         with sqlite3.connect(self.db_path) as connection:
             cursor = connection.execute(
-                "DELETE FROM ingestion_leases WHERE resource_id=? AND ownership_token=? AND fencing_token=?",
-                (resource_id, token, fencing),
+                "UPDATE ingestion_leases SET expires_at=0,updated_at=? WHERE resource_id=? AND ownership_token=? "
+                "AND fencing_token=?", (time.time(), resource_id, token, fencing),
             )
             connection.commit()
             return cursor.rowcount == 1

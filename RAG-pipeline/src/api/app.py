@@ -23,6 +23,7 @@ from src.infrastructure.ingestion_queues import InMemoryIngestionQueue, RedisStr
 from src.infrastructure.repositories import (
     LocalFileObjectStorage, SQLiteDocumentRepository, SQLiteLeaseRepository, SQLiteTaskRepository,
 )
+from src.infrastructure.publication import SQLitePublicationRepository
 
 
 def create_api(
@@ -50,14 +51,26 @@ def create_api(
                               settings.queue.visibility_timeout_seconds, settings.queue.capacity)
     else:
         raise ValueError(f"Unsupported ingestion queue backend: {settings.queue.backend}")
-    metrics = ApiMetrics(lambda: work_queue.stats().depth, work_queue.stats)
     storage = LocalFileObjectStorage()
-    documents = SQLiteDocumentRepository(settings.storage.control_db_path)
-    tasks = SQLiteTaskRepository(settings.storage.control_db_path)
-    leases = SQLiteLeaseRepository(settings.storage.control_db_path)
+    if settings.profile is Profile.TEST or settings.providers.task_repository == "sqlite":
+        documents = SQLiteDocumentRepository(settings.storage.control_db_path)
+        tasks = SQLiteTaskRepository(settings.storage.control_db_path)
+        leases = SQLiteLeaseRepository(settings.storage.control_db_path)
+        publication = SQLitePublicationRepository(
+            settings.storage.control_db_path, settings.publication.retention_versions
+        )
+    else:
+        from src.infrastructure.postgres import PostgresControlPlane
+        control = PostgresControlPlane(
+            settings.storage.control_database_url, settings.publication.retention_versions
+        )
+        documents = tasks = leases = publication = control
+    metrics = ApiMetrics(lambda: work_queue.stats().depth, work_queue.stats, publication.stats)
     dispatcher = OutboxDispatcher(tasks, work_queue)
-    document_service = DocumentControlService(rag, settings, storage, documents, tasks, work_queue, metrics, dispatcher)
-    query_service = QueryApplicationService(rag, settings, documents, metrics)
+    document_service = DocumentControlService(
+        rag, settings, storage, documents, tasks, work_queue, metrics, dispatcher, publication
+    )
+    query_service = QueryApplicationService(rag, settings, documents, metrics, publication)
     probes = list(readiness_probes) if readiness_probes is not None else [
         ("dense_index", rag.ingestion.vector_store, True),
         ("sparse_index", rag.ingestion.sparse_store, True),
@@ -71,9 +84,9 @@ def create_api(
         stop_dispatch = threading.Event()
         def dispatch_loop():
             while not stop_dispatch.wait(1.0):
-                dispatcher.reconcile_queued(documents, settings.api.config_version)
+                dispatcher.reconcile_queued(documents, settings.pipeline.pipeline_version)
                 dispatcher.dispatch_once()
-        dispatcher.reconcile_queued(documents, settings.api.config_version)
+        dispatcher.reconcile_queued(documents, settings.pipeline.pipeline_version)
         dispatcher.dispatch_once()
         dispatch_thread = threading.Thread(target=dispatch_loop, daemon=True, name="outbox-dispatcher")
         dispatch_thread.start()
@@ -84,6 +97,7 @@ def create_api(
                 work_queue, tasks, documents, leases, storage, rag, "test-worker", max_concurrency=2,
                 poll_timeout=0.05, lease_duration=5, heartbeat_interval=1, max_attempts=2,
                 retry_min=0, retry_max=0, shutdown_timeout=2,
+                publication=publication, graph_required=settings.pipeline.graph_index_required,
             )
             worker_thread = threading.Thread(target=embedded_worker.run, daemon=True, name="test-ingestion-worker")
             worker_thread.start()

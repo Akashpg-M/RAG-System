@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 from src.core.contracts import IndexingStatus
 from src.core.events import IngestionEvent
+from src.core.publication import IndexStageResult, chunk_manifest
 from src.core.queue import IngestionQueue, QueueMessage, QueueSaturated
 
 
@@ -78,7 +79,8 @@ class IngestionWorker:
     def __init__(self, queue: IngestionQueue, tasks: Any, documents: Any, leases: Any, storage: Any,
                  application: Any, worker_id: str, max_concurrency: int = 2, poll_timeout: float = 5,
                  lease_duration: float = 120, heartbeat_interval: float = 30, max_attempts: int = 5,
-                 retry_min: float = 1, retry_max: float = 300, shutdown_timeout: float = 30):
+                 retry_min: float = 1, retry_max: float = 300, shutdown_timeout: float = 30,
+                 publication: Any = None, graph_required: bool = False, maintenance: Any = None):
         if heartbeat_interval >= lease_duration:
             raise ValueError("heartbeat interval must be smaller than lease duration")
         self.queue, self.tasks, self.documents, self.leases, self.storage = queue, tasks, documents, leases, storage
@@ -87,6 +89,8 @@ class IngestionWorker:
         self.lease_duration, self.heartbeat_interval = lease_duration, heartbeat_interval
         self.max_attempts, self.retry_min, self.retry_max = max_attempts, retry_min, retry_max
         self.shutdown_timeout = shutdown_timeout
+        self.publication, self.graph_required = publication, graph_required
+        self.maintenance = maintenance
         self._stop = threading.Event()
         self._slots = threading.BoundedSemaphore(max_concurrency)
         self._threads: set[threading.Thread] = set()
@@ -99,6 +103,11 @@ class IngestionWorker:
             message = self.queue.receive(self.poll_timeout)
             if message is None:
                 self._slots.release()
+                if self.maintenance:
+                    try:
+                        self.maintenance()
+                    except Exception:
+                        logger.exception("worker maintenance pass failed")
                 continue
             thread = threading.Thread(target=self._process_guarded, args=(message,), daemon=False)
             with self._lock:
@@ -162,7 +171,8 @@ class IngestionWorker:
             suffix = Path(event.object_key).suffix
             local_path = Path(temporary) / f"document{suffix}"
             local_path.write_bytes(data)
-            version = self.documents.get_latest(event.document_id)
+            get_version = getattr(self.documents, "get_version", None)
+            version = get_version(event.document_id, event.version_id) if get_version else self.documents.get_latest(event.document_id)
             if version is None or version.version_id != event.version_id:
                 raise PermanentIngestionError("document version unavailable")
             task = replace(task, attempt_count=max(task.attempt_count + 1, message.attempts), fencing_token=fencing)
@@ -178,11 +188,35 @@ class IngestionWorker:
             from src.api.services import MetadataChunker
             metadata = {"document_id": event.document_id, "version_id": event.version_id,
                         **{k: v for k, v in version.metadata.items() if k not in ("status", "content_type")}}
-            self.application.ingestion.ingest_document(str(local_path), MetadataChunker(self.application.chunker, metadata),
-                                                       event.document_id, event.version_id, progress)
+            if self.publication:
+                prepared = self.application.ingestion.prepare_document(
+                    str(local_path), MetadataChunker(self.application.chunker, metadata),
+                    event.document_id, event.version_id, progress,
+                )
+                entries, checksum = chunk_manifest(prepared.children)
+                self.publication.save_manifest(event.document_id, event.version_id, entries)
+                self.application.ingestion.prepare_embeddings(prepared, progress)
+                self._run_index_stage("dense", event, prepared, checksum,
+                                      lambda: self.application.ingestion.write_dense(prepared, progress))
+                self._run_index_stage("sparse", event, prepared, checksum,
+                                      lambda: self.application.ingestion.write_sparse(prepared, progress))
+                try:
+                    self._run_index_stage("graph", event, prepared, checksum,
+                                          lambda: self.application.ingestion.write_graph(prepared, progress))
+                except Exception:
+                    if self.graph_required:
+                        raise
+                required = ["dense", "sparse", *( ["graph"] if self.graph_required else [])]
+                self.publication.activate(event.document_id, event.version_id, resource_id, ownership, fencing, required)
+            else:
+                self.application.ingestion.ingest_document(
+                    str(local_path), MetadataChunker(self.application.chunker, metadata),
+                    event.document_id, event.version_id, progress,
+                )
             if not self.leases.owns(resource_id, ownership, fencing, time.time()):
                 raise ConnectionError("lease ownership lost")
-            self.documents.save(replace(version, metadata={**version.metadata, "status": IndexingStatus.READY.value}))
+            if not self.publication:
+                self.documents.save(replace(version, metadata={**version.metadata, "status": IndexingStatus.READY.value}))
             self._transition(event.task_id, IndexingStatus.READY, fencing=fencing)
             self.queue.acknowledge(message)
         except Exception as error:
@@ -192,7 +226,7 @@ class IngestionWorker:
             try:
                 self._transition(event.task_id, final, code, fencing=fencing)
                 version = self.documents.get_latest(event.document_id)
-                if version:
+                if version and not self.publication:
                     self.documents.save(replace(version, metadata={**version.metadata, "status": final.value}))
                 if retryable and not exhausted:
                     self._transition(event.task_id, IndexingStatus.QUEUED, fencing=fencing)
@@ -207,6 +241,20 @@ class IngestionWorker:
             heartbeat.join(timeout=self.heartbeat_interval + 0.1)
             self.leases.release(resource_id, ownership, fencing)
             shutil.rmtree(temporary, ignore_errors=True)
+
+    def _run_index_stage(self, name: str, event: IngestionEvent, prepared: Any, checksum: str,
+                         operation: Any) -> None:
+        started = time.perf_counter()
+        try:
+            operation()
+        except Exception:
+            self.publication.record_stage(event.document_id, event.version_id, IndexStageResult(
+                name, "FAILED", 0, checksum, time.perf_counter() - started, f"{name}_index_failed"
+            ))
+            raise
+        self.publication.record_stage(event.document_id, event.version_id, IndexStageResult(
+            name, "SUCCESS", len(prepared.children), checksum, time.perf_counter() - started
+        ))
 
     def _transition(self, task_id: str, status: IndexingStatus, error: Optional[str] = None,
                     fencing: Optional[int] = None) -> None:

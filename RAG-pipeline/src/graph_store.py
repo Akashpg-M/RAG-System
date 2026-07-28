@@ -62,6 +62,11 @@ class KnowledgeGraphStore:
             conn.execute("DELETE FROM triples WHERE chunk_id LIKE ?", (f"{document_id}#%",))
             conn.commit()
 
+    def delete_version(self, document_id: str, version_id: str):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM triples WHERE chunk_id LIKE ?", (f"{document_id}#{version_id}#%",))
+            conn.commit()
+
     def is_ready(self) -> bool:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("SELECT 1").fetchone()

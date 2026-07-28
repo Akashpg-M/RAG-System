@@ -69,6 +69,15 @@ class InMemoryDenseIndex:
             chunk_id: value for chunk_id, value in self.points.items() if value[0].document_id != document_id
         }
 
+    def delete_version(self, document_id: str, version_id: str) -> None:
+        self.points = {key: value for key, value in self.points.items()
+                       if not (value[0].document_id == document_id and
+                               value[0].metadata.get("version_id") == version_id)}
+
+    def version_chunks(self, document_id: str, version_id: str) -> Dict[str, str]:
+        return {chunk.chunk_id: chunk.content_hash for chunk, _ in self.points.values()
+                if chunk.document_id == document_id and chunk.metadata.get("version_id") == version_id}
+
     def is_ready(self) -> bool:
         return True
 
@@ -117,6 +126,17 @@ class InMemorySparseIndex:
             del self.documents[key]
         return stale
 
+    def delete_version(self, document_id: str, version_id: str) -> List[str]:
+        stale = [key for key, chunk in self.documents.items() if chunk.document_id == document_id and
+                 chunk.metadata.get("version_id") == version_id]
+        for key in stale:
+            del self.documents[key]
+        return stale
+
+    def version_chunks(self, document_id: str, version_id: str) -> Dict[str, str]:
+        return {chunk.chunk_id: chunk.content_hash for chunk in self.documents.values()
+                if chunk.document_id == document_id and chunk.metadata.get("version_id") == version_id}
+
     def is_ready(self) -> bool:
         return True
 
@@ -163,6 +183,10 @@ class InMemoryGraphIndex:
 
     def delete_document(self, document_id: str) -> None:
         self.triples = [item for item in self.triples if not item["chunk_id"].startswith(f"{document_id}#")]
+
+    def delete_version(self, document_id: str, version_id: str) -> None:
+        prefix = f"{document_id}#{version_id}#"
+        self.triples = [item for item in self.triples if not item["chunk_id"].startswith(prefix)]
 
     def is_ready(self) -> bool:
         return True

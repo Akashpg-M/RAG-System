@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from src.core.contracts import Vector
+from src.core.publication import PreparedDocument
 from src.core.ports import (
     CacheProvider,
     DenseIndex,
@@ -65,7 +66,19 @@ class IngestionService:
         document_id: Optional[str] = None,
         version_id: Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
-    ) -> None:
+    ) -> PreparedDocument:
+        prepared = self.prepare_document(source_uri, chunker, document_id, version_id, progress_callback)
+        self.index_prepared(prepared, progress_callback)
+        return prepared
+
+    def prepare_document(
+        self,
+        source_uri: str,
+        chunker: DocumentChunker,
+        document_id: Optional[str] = None,
+        version_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> PreparedDocument:
         source_path = Path(source_uri).resolve()
         if not source_path.is_file():
             raise FileNotFoundError(f"Document does not exist: {source_uri}")
@@ -92,6 +105,24 @@ class IngestionService:
                     prepared["chunk_id"] = parent.parent_id
                     triples.append(prepared)
 
+        return PreparedDocument(resolved_document_id, version_id, parent_chunks, child_chunks, triples)
+
+    def index_prepared(
+        self, prepared: PreparedDocument, progress_callback: Optional[Callable[[str], None]] = None
+    ) -> None:
+        self.prepare_embeddings(prepared, progress_callback)
+        if not prepared.version_id:
+            self.sparse_store.delete_document(prepared.document_id)
+            self.graph_store.delete_document(prepared.document_id)
+            self.vector_store.delete_document(prepared.document_id)
+        self.write_dense(prepared, progress_callback)
+        self.write_sparse(prepared, progress_callback)
+        self.write_graph(prepared, progress_callback)
+
+    def prepare_embeddings(
+        self, prepared: PreparedDocument, progress_callback: Optional[Callable[[str], None]] = None
+    ) -> None:
+        child_chunks = prepared.children
         if progress_callback:
             progress_callback("EMBEDDING")
         embeddings: List[Vector | None] = [None] * len(child_chunks)
@@ -123,17 +154,26 @@ class IngestionService:
         if len(final_embeddings) != len(child_chunks):
             raise RuntimeError("Embedding preparation did not produce one vector per chunk")
 
-        self.sparse_store.delete_document(resolved_document_id)
-        self.graph_store.delete_document(resolved_document_id)
-        self.vector_store.delete_document(resolved_document_id)
+        prepared.embeddings = final_embeddings
+
+    def write_dense(self, prepared: PreparedDocument,
+                    progress_callback: Optional[Callable[[str], None]] = None) -> None:
+        child_chunks = prepared.children
         if child_chunks:
             if progress_callback:
                 progress_callback("INDEXING_DENSE")
-            self.vector_store.upsert_chunks_bulk(child_chunks, final_embeddings)
+            self.vector_store.upsert_chunks_bulk(child_chunks, prepared.embeddings)
+
+    def write_sparse(self, prepared: PreparedDocument,
+                     progress_callback: Optional[Callable[[str], None]] = None) -> None:
+        if prepared.children:
             if progress_callback:
                 progress_callback("INDEXING_SPARSE")
-            self.sparse_store.add_documents(child_chunks)
-        if triples:
+            self.sparse_store.add_documents(prepared.children)
+
+    def write_graph(self, prepared: PreparedDocument,
+                    progress_callback: Optional[Callable[[str], None]] = None) -> None:
+        if prepared.triples:
             if progress_callback:
                 progress_callback("INDEXING_GRAPH")
-            self.graph_store.add_triples_bulk(triples)
+            self.graph_store.add_triples_bulk(prepared.triples)
