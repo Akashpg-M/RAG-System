@@ -212,8 +212,16 @@ class SQSQueue(IngestionQueue):
     def publish(self, body: str, event_id: str) -> str:
         if self.stats().depth >= self.capacity:
             raise QueueSaturated("ingestion queue capacity reached")
+        attributes = {"event_id": {"DataType": "String", "StringValue": event_id}}
+        try:
+            carrier = IngestionEvent.from_json(body).trace_context
+            for key in ("traceparent", "tracestate"):
+                if carrier.get(key):
+                    attributes[key] = {"DataType": "String", "StringValue": carrier[key]}
+        except Exception:
+            pass
         response = self.client.send_message(QueueUrl=self.queue_url, MessageBody=body,
-                                            MessageAttributes={"event_id": {"DataType": "String", "StringValue": event_id}})
+                                            MessageAttributes=attributes)
         return response["MessageId"]
 
     def receive(self, timeout_seconds: float) -> Optional[QueueMessage]:
@@ -222,12 +230,26 @@ class SQSQueue(IngestionQueue):
             WaitTimeSeconds=min(self.wait_time_seconds, int(max(0, timeout_seconds))),
             VisibilityTimeout=self.visibility_timeout,
             AttributeNames=["ApproximateReceiveCount", "SentTimestamp"],
+            MessageAttributeNames=["All"],
         )
         if not response.get("Messages"):
             return None
         raw = response["Messages"][0]
         attributes = raw.get("Attributes", {})
-        return QueueMessage(raw["MessageId"], raw["Body"], raw["ReceiptHandle"],
+        body = raw["Body"]
+        try:
+            event = IngestionEvent.from_json(body)
+            carrier = dict(event.trace_context)
+            for key in ("traceparent", "tracestate"):
+                value = raw.get("MessageAttributes", {}).get(key, {}).get("StringValue")
+                if value:
+                    carrier[key] = value
+            if carrier != event.trace_context:
+                from dataclasses import replace
+                body = replace(event, trace_context=carrier).to_json()
+        except Exception:
+            pass
+        return QueueMessage(raw["MessageId"], body, raw["ReceiptHandle"],
                             int(attributes.get("ApproximateReceiveCount", "1")),
                             float(attributes.get("SentTimestamp", "0")) / 1000 or None)
 
@@ -239,8 +261,15 @@ class SQSQueue(IngestionQueue):
                                               VisibilityTimeout=min(43200, max(0, int(delay_seconds))))
 
     def dead_letter(self, message: QueueMessage, reason: str) -> None:
+        attributes = {"failure_code": {"DataType": "String", "StringValue": reason}}
+        try:
+            for key, value in IngestionEvent.from_json(message.body).trace_context.items():
+                if key in ("traceparent", "tracestate") and value:
+                    attributes[key] = {"DataType": "String", "StringValue": value}
+        except Exception:
+            pass
         self.client.send_message(QueueUrl=self.dlq_url, MessageBody=message.body,
-                                 MessageAttributes={"failure_code": {"DataType": "String", "StringValue": reason}})
+                                 MessageAttributes=attributes)
         self.acknowledge(message)
 
     def heartbeat(self, message: QueueMessage) -> None:

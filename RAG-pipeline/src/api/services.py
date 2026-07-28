@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import threading
+import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +33,8 @@ from src.core.events import IngestionEvent, idempotency_key
 from src.core.ports import DocumentChunker, DocumentRepository, ObjectStorage, TaskRepository
 from src.application.ingestion_runtime import OutboxDispatcher
 from src.core.queue import IngestionQueue
+
+logger = logging.getLogger(__name__)
 
 
 ALLOWED_TRANSITIONS = {
@@ -155,7 +159,10 @@ class DocumentControlService:
         requested_document_id: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
     ) -> UploadResponse:
-        safe_name = self.validator.validate(filename, content_type, data)
+        with self.metrics.observability.span("ingestion.upload_acceptance", {
+            "rag.content_bytes": len(data), "rag.content_type": content_type,
+        }):
+            safe_name = self.validator.validate(filename, content_type, data)
         document_id = requested_document_id or uuid.uuid4().hex
         if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", document_id):
             raise ApiError(422, "invalid_document_id", "document_id must contain 8 to 128 safe characters")
@@ -213,11 +220,13 @@ class DocumentControlService:
         event = IngestionEvent(
             event_id, task_id, document_id, version_id, namespace, source_uri, content_hash,
             pipeline_version, source_uri, metadata=version_metadata,
+            trace_context=self.metrics.observability.inject(),
         )
         create = getattr(self.tasks, "create_with_outbox", None)
         if not create:
             raise RuntimeError("task repository does not support durable publication")
-        persisted, created = create(task, event_id, event.to_json())
+        with self.metrics.observability.span("ingestion.durable_task_outbox"):
+            persisted, created = create(task, event_id, event.to_json())
         if not created:
             task_id = persisted.task_id
             document_id = persisted.document_id or document_id
@@ -350,6 +359,8 @@ class QueryApplicationService:
         self.publication = publication
 
     def execute(self, request: QueryRequest, trace_id: str) -> QueryResponse:
+        telemetry = self.metrics.telemetry
+        query_started = time.perf_counter()
         if request.stream:
             raise ApiError(422, "streaming_not_supported", "Streaming is not available in this API version")
         if len(request.query) > self.config.api.max_query_length:
@@ -364,38 +375,71 @@ class QueryApplicationService:
             if invalid:
                 raise ApiError(422, "filter_not_allowed", "One or more metadata filter fields are not allowed")
             filters.update(request.filters.metadata)
-        self.metrics.increment("queries_total")
         snapshot = None
         try:
-            snapshot = self.publication.snapshot() if self.publication else None
+            snapshot_started = time.perf_counter()
+            with self.metrics.observability.span("query.publication_snapshot"):
+                snapshot = self.publication.snapshot() if self.publication else None
+            telemetry.labels(telemetry.snapshot_duration).observe(time.perf_counter() - snapshot_started)
+            telemetry.labels(telemetry.snapshot_documents).observe(len(snapshot.active_versions) if snapshot else 0)
             candidate_count = request.top_k * (
                 self.config.publication.reconciliation_candidate_multiplier if snapshot else 1
             )
-            context = self.application.retrieval.retrieve_context(
-                request.query, top_k=candidate_count, filters=filters or None, mode=request.retrieval_mode.value
-            )
+            with self.metrics.observability.span("query.retrieval", {
+                "rag.strategy": request.retrieval_mode.value, "rag.requested_top_k": request.top_k,
+            }):
+                context = self.application.retrieval.retrieve_context(
+                    request.query, top_k=candidate_count, filters=filters or None, mode=request.retrieval_mode.value
+                )
             if snapshot:
+                filtering_started = time.perf_counter()
                 approved = []
-                for candidate in context:
-                    metadata = candidate.get("metadata", {})
-                    candidate_document = str(metadata.get("document_id") or candidate.get("document_id") or
-                                             str(candidate.get("chunk_id", "")).split("#", 1)[0])
-                    candidate_version = str(metadata.get("version_id", ""))
-                    namespace = str(metadata.get("namespace", "default"))
-                    if filters.get("document_id") and candidate_document != filters["document_id"]:
-                        continue
-                    if any(metadata.get(key) != value for key, value in filters.items() if key != "document_id"):
-                        continue
-                    if namespace == self.config.publication.namespace and snapshot.allows(
-                        candidate_document, candidate_version, namespace
-                    ):
-                        approved.append(candidate)
+                with self.metrics.observability.span("query.publication_filter"):
+                    for candidate in context:
+                        metadata = candidate.get("metadata", {})
+                        candidate_document = str(metadata.get("document_id") or candidate.get("document_id") or
+                                                 str(candidate.get("chunk_id", "")).split("#", 1)[0])
+                        candidate_version = str(metadata.get("version_id", ""))
+                        namespace = str(metadata.get("namespace", "default"))
+                        reason = None
+                        if candidate_document in snapshot.tombstones:
+                            reason = "tombstoned"
+                        elif filters.get("document_id") and candidate_document != filters["document_id"]:
+                            reason = "filter"
+                        elif any(metadata.get(key) != value for key, value in filters.items()
+                                 if key != "document_id"):
+                            reason = "filter"
+                        elif namespace != self.config.publication.namespace:
+                            reason = "namespace"
+                        elif candidate_document not in snapshot.active_versions:
+                            reason = "orphaned"
+                        elif snapshot.active_versions[candidate_document] != candidate_version:
+                            reason = "inactive"
+                        if reason:
+                            telemetry.labels(telemetry.discarded, reason=reason).inc()
+                        else:
+                            approved.append(candidate)
                 context = approved[:request.top_k]
+                telemetry.labels(telemetry.filter_duration).observe(time.perf_counter() - filtering_started)
+                telemetry.labels(telemetry.candidates_filtered).observe(len(context))
+                # Over-fetching is the bounded refill strategy in Stage 4. This records
+                # whether it was needed without issuing an unbounded retrieval loop.
+                refill_rounds = int(len(approved) < request.top_k and len(context) < candidate_count)
+                telemetry.labels(telemetry.refill_rounds).observe(refill_rounds)
+                if len(context) < request.top_k:
+                    logger.info("publication_filter_shortfall", extra={
+                        "component": "publication_filter", "outcome": "empty" if not context else "degraded",
+                    })
         except Exception as error:
-            self.metrics.increment("query_failures_total")
+            telemetry.labels(telemetry.query_errors, error_type="retrieval").inc()
+            telemetry.labels(telemetry.query_requests, outcome="failure",
+                             strategy=request.retrieval_mode.value).inc()
+            telemetry.labels(telemetry.query_duration).observe(time.perf_counter() - query_started)
             raise ApiError(503, "query_failed", "Query processing is temporarily unavailable") from error
         if not context:
-            self.metrics.increment("empty_context_total")
+            telemetry.labels(telemetry.empty_context).inc()
+            telemetry.labels(telemetry.query_requests, outcome="empty", strategy=request.retrieval_mode.value).inc()
+            telemetry.labels(telemetry.query_duration).observe(time.perf_counter() - query_started)
             return QueryResponse(
                 answer="I cannot answer because no matching indexed context was found.",
                 retrieval_strategy=request.retrieval_mode.value, sources=[], model_version=self.config.models.groq_model,
@@ -405,14 +449,22 @@ class QueryApplicationService:
                 graph_index_required=self.config.pipeline.graph_index_required,
             )
         try:
-            answer = "".join(self.application.generator.generate_stream(request.query, context))
+            generation_started = time.perf_counter()
+            with self.metrics.observability.span("query.generation"):
+                answer = "".join(self.application.generator.generate_stream(request.query, context))
+            telemetry.labels(telemetry.generation_duration).observe(time.perf_counter() - generation_started)
         except Exception as error:
-            self.metrics.increment("query_failures_total")
+            telemetry.labels(telemetry.query_errors, error_type="generation").inc()
+            telemetry.labels(telemetry.query_requests, outcome="failure",
+                             strategy=request.retrieval_mode.value).inc()
+            telemetry.labels(telemetry.query_duration).observe(time.perf_counter() - query_started)
             raise ApiError(503, "generation_failed", "Answer generation is temporarily unavailable") from error
         sources = [self._source(candidate) for candidate in context]
         degraded = bool(snapshot and any(
             (source.document_id, source.version_id) in snapshot.degraded_versions for source in sources
         ))
+        telemetry.labels(telemetry.query_requests, outcome="success", strategy=request.retrieval_mode.value).inc()
+        telemetry.labels(telemetry.query_duration).observe(time.perf_counter() - query_started)
         return QueryResponse(
             answer=answer, retrieval_strategy=request.retrieval_mode.value, sources=sources,
             model_version=self.config.models.groq_model, configuration_version=self.config.api.config_version,

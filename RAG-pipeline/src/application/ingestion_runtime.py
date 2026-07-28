@@ -15,6 +15,7 @@ from src.core.contracts import IndexingStatus
 from src.core.events import IngestionEvent
 from src.core.publication import IndexStageResult, chunk_manifest
 from src.core.queue import IngestionQueue, QueueMessage, QueueSaturated
+from src.observability import Observability, get_observability
 
 
 logger = logging.getLogger(__name__)
@@ -41,16 +42,24 @@ def classify_failure(error: BaseException, stage: str = "unknown") -> tuple[bool
 
 
 class OutboxDispatcher:
-    def __init__(self, repository: Any, queue: IngestionQueue):
+    def __init__(self, repository: Any, queue: IngestionQueue, observability: Optional[Observability] = None):
         self.repository, self.queue = repository, queue
+        self.observability = observability or get_observability()
+        self.metrics_port = 0
 
     def dispatch_once(self, limit: int = 100) -> int:
         published = 0
         for event_id, _, payload in self.repository.pending_outbox(limit):
             try:
-                self.queue.publish(payload, event_id)
-                self.repository.mark_published(event_id)
-                published += 1
+                try:
+                    event = IngestionEvent.from_json(payload)
+                    parent = self.observability.extract(event.trace_context)
+                except Exception:
+                    parent = None
+                with self.observability.span("outbox.publish", {"messaging.system": type(self.queue).__name__}, parent):
+                    self.queue.publish(payload, event_id)
+                    self.repository.mark_published(event_id)
+                    published += 1
             except QueueSaturated:
                 break
             except Exception:
@@ -80,7 +89,8 @@ class IngestionWorker:
                  application: Any, worker_id: str, max_concurrency: int = 2, poll_timeout: float = 5,
                  lease_duration: float = 120, heartbeat_interval: float = 30, max_attempts: int = 5,
                  retry_min: float = 1, retry_max: float = 300, shutdown_timeout: float = 30,
-                 publication: Any = None, graph_required: bool = False, maintenance: Any = None):
+                 publication: Any = None, graph_required: bool = False, maintenance: Any = None,
+                 observability: Optional[Observability] = None):
         if heartbeat_interval >= lease_duration:
             raise ValueError("heartbeat interval must be smaller than lease duration")
         self.queue, self.tasks, self.documents, self.leases, self.storage = queue, tasks, documents, leases, storage
@@ -91,29 +101,38 @@ class IngestionWorker:
         self.shutdown_timeout = shutdown_timeout
         self.publication, self.graph_required = publication, graph_required
         self.maintenance = maintenance
+        self.observability = observability or get_observability()
         self._stop = threading.Event()
         self._slots = threading.BoundedSemaphore(max_concurrency)
         self._threads: set[threading.Thread] = set()
         self._lock = threading.Lock()
 
     def run(self) -> None:
-        while not self._stop.is_set():
-            if not self._slots.acquire(timeout=min(0.2, self.poll_timeout)):
-                continue
-            message = self.queue.receive(self.poll_timeout)
-            if message is None:
-                self._slots.release()
-                if self.maintenance:
-                    try:
-                        self.maintenance()
-                    except Exception:
-                        logger.exception("worker maintenance pass failed")
-                continue
-            thread = threading.Thread(target=self._process_guarded, args=(message,), daemon=False)
-            with self._lock:
-                self._threads.add(thread)
-            thread.start()
-        self._wait_for_active()
+        active_workers = self.observability.metrics.labels(self.observability.metrics.active_workers)
+        active_workers.inc()
+        try:
+            while not self._stop.is_set():
+                if not self._slots.acquire(timeout=min(0.2, self.poll_timeout)):
+                    continue
+                with self.observability.span("queue.receive", {"messaging.operation": "receive"}):
+                    message = self.queue.receive(self.poll_timeout)
+                if message is None:
+                    self._slots.release()
+                    if self.maintenance:
+                        try:
+                            self.maintenance()
+                        except Exception:
+                            logger.exception("worker_maintenance_failed", extra={
+                                "component": "maintenance", "error_code": "unexpected",
+                            })
+                    continue
+                thread = threading.Thread(target=self._process_guarded, args=(message,), daemon=False)
+                with self._lock:
+                    self._threads.add(thread)
+                thread.start()
+            self._wait_for_active()
+        finally:
+            active_workers.dec()
 
     def stop(self) -> None:
         self._stop.set()
@@ -138,17 +157,40 @@ class IngestionWorker:
 
     def process_message(self, message: QueueMessage) -> None:
         try:
+            carrier = IngestionEvent.from_json(message.body).trace_context
+        except Exception:
+            carrier = {}
+        parent = self.observability.extract(carrier)
+        active = self.observability.metrics.labels(self.observability.metrics.active_ingestions)
+        active.inc()
+        started = time.perf_counter()
+        try:
+            with self.observability.span("ingestion.process", {
+                "messaging.operation": "process", "messaging.delivery_count": message.attempts,
+            }, parent):
+                self._process_message_impl(message)
+        finally:
+            active.dec()
+            self.observability.metrics.labels(
+                self.observability.metrics.ingestion_duration, stage="queue"
+            ).observe(time.perf_counter() - started)
+
+    def _process_message_impl(self, message: QueueMessage) -> None:
+        try:
             event = IngestionEvent.from_json(message.body)
         except Exception as error:
             if message.attempts >= self.max_attempts:
                 self.queue.dead_letter(message, "invalid_event_envelope")
+                self.observability.metrics.labels(self.observability.metrics.dlq).inc()
             else:
                 self.queue.retry(message, self._backoff(message.attempts))
+                self.observability.metrics.labels(self.observability.metrics.retries, stage="queue").inc()
             logger.warning("poison ingestion message: %s", type(error).__name__)
             return
         task = self.tasks.get(event.task_id)
         if task is None:
             self.queue.dead_letter(message, "task_not_found")
+            self.observability.metrics.labels(self.observability.metrics.dlq).inc()
             return
         if task.status is IndexingStatus.READY:
             self.queue.acknowledge(message)
@@ -156,7 +198,8 @@ class IngestionWorker:
         resource_id = f"{event.document_id}:{event.version_id}"
         ownership = uuid.uuid4().hex
         now = time.time()
-        fencing = self.leases.acquire(resource_id, self.worker_id, ownership, now, self.lease_duration)
+        with self.observability.span("ingestion.lease_acquire"):
+            fencing = self.leases.acquire(resource_id, self.worker_id, ownership, now, self.lease_duration)
         if fencing is None:
             self.queue.retry(message, self._backoff(message.attempts))
             return
@@ -167,7 +210,12 @@ class IngestionWorker:
         temporary = tempfile.mkdtemp(prefix=f"rag-ingest-{event.task_id[:8]}-")
         stage = "storage"
         try:
-            data = self.storage.read_bytes(event.source_uri)
+            stage_started = time.perf_counter()
+            with self.observability.span("ingestion.storage_download"):
+                data = self.storage.read_bytes(event.source_uri)
+            self.observability.metrics.labels(
+                self.observability.metrics.ingestion_duration, stage="storage"
+            ).observe(time.perf_counter() - stage_started)
             suffix = Path(event.object_key).suffix
             local_path = Path(temporary) / f"document{suffix}"
             local_path.write_bytes(data)
@@ -194,20 +242,55 @@ class IngestionWorker:
                     event.document_id, event.version_id, progress,
                 )
                 entries, checksum = chunk_manifest(prepared.children)
-                self.publication.save_manifest(event.document_id, event.version_id, entries)
-                self.application.ingestion.prepare_embeddings(prepared, progress)
+                manifest_started = time.perf_counter()
+                with self.observability.span("ingestion.manifest_persist"):
+                    self.publication.save_manifest(event.document_id, event.version_id, entries)
+                self.observability.metrics.labels(
+                    self.observability.metrics.ingestion_duration, stage="manifest"
+                ).observe(time.perf_counter() - manifest_started)
+                embedding_started = time.perf_counter()
+                with self.observability.span("ingestion.embedding"):
+                    self.application.ingestion.prepare_embeddings(prepared, progress)
+                embedding_elapsed = time.perf_counter() - embedding_started
+                self.observability.metrics.labels(self.observability.metrics.embedding_batch_duration).observe(
+                    embedding_elapsed
+                )
+                self.observability.metrics.labels(self.observability.metrics.embedding_batch_size).observe(
+                    len(prepared.children)
+                )
                 self._run_index_stage("dense", event, prepared, checksum,
                                       lambda: self.application.ingestion.write_dense(prepared, progress))
                 self._run_index_stage("sparse", event, prepared, checksum,
                                       lambda: self.application.ingestion.write_sparse(prepared, progress))
+                degraded = False
                 try:
                     self._run_index_stage("graph", event, prepared, checksum,
                                           lambda: self.application.ingestion.write_graph(prepared, progress))
                 except Exception:
                     if self.graph_required:
                         raise
+                    degraded = True
                 required = ["dense", "sparse", *( ["graph"] if self.graph_required else [])]
-                self.publication.activate(event.document_id, event.version_id, resource_id, ownership, fencing, required)
+                activation_started = time.perf_counter()
+                try:
+                    with self.observability.span("ingestion.atomic_activation"):
+                        self.publication.activate(
+                            event.document_id, event.version_id, resource_id, ownership, fencing, required
+                        )
+                    self.observability.metrics.labels(
+                        self.observability.metrics.publications, outcome="degraded" if degraded else "success"
+                    ).inc()
+                    if degraded:
+                        self.observability.metrics.labels(self.observability.metrics.publication_degraded).inc()
+                except Exception:
+                    self.observability.metrics.labels(
+                        self.observability.metrics.publications, outcome="failure"
+                    ).inc()
+                    raise
+                finally:
+                    self.observability.metrics.labels(
+                        self.observability.metrics.ingestion_duration, stage="activation"
+                    ).observe(time.perf_counter() - activation_started)
             else:
                 self.application.ingestion.ingest_document(
                     str(local_path), MetadataChunker(self.application.chunker, metadata),
@@ -218,7 +301,8 @@ class IngestionWorker:
             if not self.publication:
                 self.documents.save(replace(version, metadata={**version.metadata, "status": IndexingStatus.READY.value}))
             self._transition(event.task_id, IndexingStatus.READY, fencing=fencing)
-            self.queue.acknowledge(message)
+            with self.observability.span("queue.acknowledge"):
+                self.queue.acknowledge(message)
         except Exception as error:
             retryable, code = classify_failure(error, stage)
             exhausted = message.attempts >= self.max_attempts
@@ -231,8 +315,14 @@ class IngestionWorker:
                 if retryable and not exhausted:
                     self._transition(event.task_id, IndexingStatus.QUEUED, fencing=fencing)
                     self.queue.retry(message, self._backoff(message.attempts))
+                    self.observability.metrics.labels(self.observability.metrics.retries, stage=self._safe_stage(stage)).inc()
                 else:
                     self.queue.dead_letter(message, code)
+                    self.observability.metrics.labels(self.observability.metrics.dlq).inc()
+                self.observability.metrics.labels(
+                    self.observability.metrics.ingestion_failures,
+                    stage=self._safe_stage(stage), error_type="unexpected" if retryable else "validation",
+                ).inc()
             except Exception:
                 # No acknowledgement: the transport will redeliver after visibility/claim expiry.
                 logger.exception("failed to persist controlled ingestion failure")
@@ -240,21 +330,37 @@ class IngestionWorker:
             heartbeat_stop.set()
             heartbeat.join(timeout=self.heartbeat_interval + 0.1)
             self.leases.release(resource_id, ownership, fencing)
-            shutil.rmtree(temporary, ignore_errors=True)
+            with self.observability.span("ingestion.temporary_cleanup"):
+                shutil.rmtree(temporary, ignore_errors=True)
 
     def _run_index_stage(self, name: str, event: IngestionEvent, prepared: Any, checksum: str,
                          operation: Any) -> None:
         started = time.perf_counter()
         try:
-            operation()
+            with self.observability.span(f"ingestion.index.{name}", {"rag.index": name}):
+                operation()
         except Exception:
             self.publication.record_stage(event.document_id, event.version_id, IndexStageResult(
                 name, "FAILED", 0, checksum, time.perf_counter() - started, f"{name}_index_failed"
             ))
+            self.observability.metrics.labels(
+                self.observability.metrics.index_publication_duration, index=name
+            ).observe(time.perf_counter() - started)
             raise
         self.publication.record_stage(event.document_id, event.version_id, IndexStageResult(
             name, "SUCCESS", len(prepared.children), checksum, time.perf_counter() - started
         ))
+        self.observability.metrics.labels(
+            self.observability.metrics.index_publication_duration, index=name
+        ).observe(time.perf_counter() - started)
+
+    @staticmethod
+    def _safe_stage(stage: str) -> str:
+        value = stage.lower().replace("indexing_", "")
+        return value if value in {
+            "acceptance", "outbox", "queue", "lease", "storage", "parsing", "chunking", "manifest",
+            "embedding", "dense", "sparse", "graph", "validation", "activation", "acknowledgement", "cleanup",
+        } else "queue"
 
     def _transition(self, task_id: str, status: IndexingStatus, error: Optional[str] = None,
                     fencing: Optional[int] = None) -> None:
@@ -263,6 +369,9 @@ class IngestionWorker:
         if fencing is not None and current and current.fencing_token not in (0, fencing):
             raise RuntimeError("stale fencing token")
         LifecycleController(self.tasks).transition(task_id, status, error)
+        self.observability.metrics.labels(
+            self.observability.metrics.ingestion_tasks, status=status.value.lower()
+        ).inc()
 
     def _heartbeat(self, resource: str, ownership: str, fencing: int, message: QueueMessage,
                    stopped: threading.Event) -> None:

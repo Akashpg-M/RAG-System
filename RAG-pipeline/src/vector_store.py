@@ -31,10 +31,18 @@ class ProductionVectorStore:
         
         # Create it if it doesn't exist
         if self.collection_name not in existing_collections:
-            self.client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
-            )
+            try:
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
+                )
+            except Exception as error:
+                # API and worker may initialize concurrently. Qdrant's check/create
+                # is not atomic, so accept only the verified already-created race.
+                if getattr(error, "status_code", None) != 409 or not self.client.collection_exists(
+                    self.collection_name
+                ):
+                    raise
 
     def filter_existing_chunks_batched(self, chunks: List[ChildChunk]) -> List[ChildChunk]:
         """

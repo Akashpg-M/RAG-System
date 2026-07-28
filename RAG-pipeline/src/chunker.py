@@ -80,7 +80,7 @@ class SemanticDoclingChunker:
         return windows
 
     def process_file(self, file_path: str, doc_id: str) -> Tuple[List[ParentChunk], List[ChildChunk]]:
-        logger.info(f"Docling parsing AST for file: {file_path}")
+        logger.info("document_parse_started", extra={"component": "docling", "lifecycle_stage": "parsing"})
         conversion_result = self.converter.convert(file_path)
         docling_doc = conversion_result.document
 

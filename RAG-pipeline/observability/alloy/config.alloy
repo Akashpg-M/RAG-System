@@ -1,0 +1,41 @@
+discovery.docker "rag" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "rag" {
+  targets = discovery.docker.rag.targets
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex = "/(.*)"
+    target_label = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label = "service"
+  }
+}
+
+loki.source.docker "rag" {
+  host = "unix:///var/run/docker.sock"
+  targets = discovery.relabel.rag.output
+  forward_to = [loki.process.rag.receiver]
+  refresh_interval = "5s"
+}
+
+loki.process "rag" {
+  stage.json {
+    expressions = {
+      trace_id = "trace_id",
+      severity = "severity",
+      event = "event",
+    }
+  }
+  stage.labels {
+    values = { severity = "" }
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint { url = "http://loki:3100/loki/api/v1/push" }
+}

@@ -1,8 +1,10 @@
 import logging
+import time
 from html import escape
 from typing import List, Dict, Any, Iterator
 from groq import Groq
 from src.config import Config
+from src.observability import get_observability
 
 logger = logging.getLogger("StreamingGenerator")
 
@@ -78,23 +80,32 @@ class ProductionResponseGenerator:
             logger.warning("All contexts fell below the rerank score threshold. Falling back to top candidates.")
             viable_context = context_pool[:2]
 
-        messages = self._build_xml_context_prompt(query, viable_context)
+        telemetry = get_observability()
+        with telemetry.span("query.prompt_construct", {"rag.context_count": len(viable_context)}):
+            messages = self._build_xml_context_prompt(query, viable_context)
 
         try:
             if self.llm_client is None:
                 raise RuntimeError("GROQ_API_KEY is not configured")
-            stream = self.llm_client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=0.1,  # Low temperature forces highly deterministic, factual alignment
-                stream=True
-            )
-            
-            for chunk in stream:
-                token = chunk.choices[0].delta.content
-                if token:
-                    yield token
+            started = time.perf_counter()
+            first_token = True
+            with telemetry.span("query.generation.provider", {"gen_ai.system": "groq"}):
+                stream = self.llm_client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.1,
+                    stream=True
+                )
+                for chunk in stream:
+                    token = chunk.choices[0].delta.content
+                    if token:
+                        if first_token:
+                            telemetry.metrics.labels(telemetry.metrics.ttft).observe(time.perf_counter() - started)
+                            first_token = False
+                        yield token
                     
-        except Exception as e:
-            logger.error(f"Streaming token generation failure: {str(e)}")
+        except Exception:
+            logger.exception("generation_provider_failed", extra={
+                "component": "generation_provider", "error_code": "generation",
+            })
             yield "\n[Generation is temporarily unavailable.]"

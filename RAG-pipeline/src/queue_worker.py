@@ -44,7 +44,7 @@ class IngestionQueueManager:
             }
             
         self.task_queue.put({"task_id": task_id, "file_path": file_path})
-        logger.info(f"Task {task_id} successfully registered for file: {file_path}")
+        logger.info("legacy_task_registered", extra={"component": "legacy_queue", "outcome": "success"})
         return task_id
 
     def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
@@ -85,19 +85,21 @@ class IngestionQueueManager:
                 file_path = task["file_path"]
                 
                 self._update_status(task_id, TaskStatus.PROCESSING)
-                logger.info(f"Worker thread processing active task: {task_id}")
+                logger.info("legacy_task_processing", extra={"component": "legacy_queue"})
                 
                 # Execute the heavy synchronous pipeline end-to-end
                 self.pipeline.ingest_document(file_path, self.chunker)
                 
                 self._update_status(task_id, TaskStatus.COMPLETED)
-                logger.info(f"Task {task_id} processed successfully.")
+                logger.info("legacy_task_completed", extra={"component": "legacy_queue", "outcome": "success"})
                 
-            except Exception as e:
+            except Exception as error:
                 task_id = task.get("task_id") if isinstance(task, dict) else None
-                logger.error(f"Task processing failure on ID {task_id}: {str(e)}")
+                logger.error("legacy_task_failed", extra={
+                    "component": "legacy_queue", "error_code": "unexpected", "outcome": "failure",
+                })
                 if task_id:
-                    self._update_status(task_id, TaskStatus.FAILED, error=str(e))
+                    self._update_status(task_id, TaskStatus.FAILED, error=type(error).__name__)
             finally:
                 if task is not None:
                     self.task_queue.task_done()

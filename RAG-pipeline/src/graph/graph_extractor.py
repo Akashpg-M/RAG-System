@@ -71,8 +71,10 @@ class GraphExtractor:
                 
             return validated_triples
             
-        except Exception as e:
-            logger.error(f"Failed graph extraction execution trace: {str(e)}")
+        except Exception:
+            logger.error("graph_extraction_failed", extra={
+                "component": "graph_extractor", "error_code": "graph_index", "outcome": "degraded",
+            })
             return []
 
     def _normalize_entity(self, entity_name: str) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -8,38 +9,56 @@ from typing import Any
 
 from src.core.contracts import DocumentVersion, IndexingStatus, IngestionTask
 from src.core.events import IngestionEvent, idempotency_key, parse_s3_notification
+from src.observability import Observability, get_observability
 
 
 class RollbackService:
-    def __init__(self, publication: Any):
+    def __init__(self, publication: Any, observability: Observability | None = None):
         self.publication = publication
+        self.observability = observability or get_observability()
 
     def rollback(self, document_id: str, version_id: str) -> tuple[int, bool]:
-        return self.publication.rollback(document_id, version_id)
+        with self.observability.span("publication.rollback"):
+            return self.publication.rollback(document_id, version_id)
 
 
 class CleanupService:
-    def __init__(self, publication: Any, documents: Any, storage: Any, ingestion: Any):
+    def __init__(self, publication: Any, documents: Any, storage: Any, ingestion: Any,
+                 observability: Observability | None = None):
         self.publication, self.documents, self.storage, self.ingestion = publication, documents, storage, ingestion
+        self.observability = observability or get_observability()
 
     def run_once(self) -> int:
         completed = 0
         for job_id, document_id, version_id, job_type in self.publication.pending_cleanup():
+            started = time.perf_counter()
             try:
-                if job_type == "RETIRE_VERSION" and version_id:
-                    for index in (self.ingestion.vector_store, self.ingestion.sparse_store, self.ingestion.graph_store):
-                        delete = getattr(index, "delete_version", None)
-                        if delete:
-                            delete(document_id, version_id)
-                elif job_type == "DELETE_DOCUMENT":
-                    self.ingestion.delete_document_by_id(document_id)
-                    list_versions = getattr(self.documents, "list_versions", None)
-                    for version in list_versions(document_id) if list_versions else []:
-                        self.storage.delete(version.source_uri)
+                with self.observability.span("publication.cleanup", {"rag.cleanup_type": job_type}):
+                    if job_type == "RETIRE_VERSION" and version_id:
+                        for index in (self.ingestion.vector_store, self.ingestion.sparse_store,
+                                      self.ingestion.graph_store):
+                            delete = getattr(index, "delete_version", None)
+                            if delete:
+                                delete(document_id, version_id)
+                    elif job_type == "DELETE_DOCUMENT":
+                        self.ingestion.delete_document_by_id(document_id)
+                        list_versions = getattr(self.documents, "list_versions", None)
+                        for version in list_versions(document_id) if list_versions else []:
+                            self.storage.delete(version.source_uri)
                 self.publication.complete_cleanup(job_id, True)
+                self.observability.metrics.labels(
+                    self.observability.metrics.cleanup_jobs, outcome="success"
+                ).inc()
                 completed += 1
             except Exception:
                 self.publication.complete_cleanup(job_id, False, "physical_cleanup_failed")
+                self.observability.metrics.labels(
+                    self.observability.metrics.cleanup_jobs, outcome="failure"
+                ).inc()
+            finally:
+                self.observability.metrics.labels(self.observability.metrics.cleanup_duration).observe(
+                    time.perf_counter() - started
+                )
         return completed
 
 
@@ -61,8 +80,10 @@ class ReconciliationReport:
 
 class ReconciliationService:
     """Read-only by default; inspectors expose deterministic version chunk IDs."""
-    def __init__(self, publication: Any, inspectors: dict[str, Any]):
+    def __init__(self, publication: Any, inspectors: dict[str, Any],
+                 observability: Observability | None = None):
         self.publication, self.inspectors = publication, inspectors
+        self.observability = observability or get_observability()
 
     def inspect_version(self, document_id: str, version_id: str) -> ReconciliationReport:
         expected = {entry.chunk_id: entry.content_hash for entry in self.publication.manifest(document_id, version_id)}
@@ -75,8 +96,12 @@ class ReconciliationService:
             for kind, values in (("missing", missing), ("orphaned", unexpected), ("checksum", mismatched)):
                 if values:
                     report.discrepancies.append(ReconciliationDiscrepancy(name, kind, len(values)))
+                    self.observability.metrics.labels(self.observability.metrics.reconciliation, type=kind).inc(
+                        len(values)
+                    )
             if len(actual) != len(expected):
                 report.discrepancies.append(ReconciliationDiscrepancy(name, "count", abs(len(actual)-len(expected))))
+                self.observability.metrics.labels(self.observability.metrics.reconciliation, type="count").inc()
         return report
 
     def inspect_control_plane(self, staging_age_seconds: float) -> ReconciliationReport:
@@ -94,9 +119,10 @@ class ReconciliationService:
 class ExternalS3EventRegistrar:
     """Create durable control-plane records for notifications not produced by the API outbox."""
     def __init__(self, documents: Any, tasks: Any, publication: Any, pipeline_version: str = "stage-4",
-                 namespace: str = "default"):
+                 namespace: str = "default", observability: Observability | None = None):
         self.documents, self.tasks, self.publication = documents, tasks, publication
         self.pipeline_version, self.namespace = pipeline_version, namespace
+        self.observability = observability or get_observability()
 
     def register(self, body: str | bytes) -> list[IngestionTask]:
         registered = []
@@ -126,7 +152,8 @@ class ExternalS3EventRegistrar:
                                  idempotency_key=claim)
             event_id = uuid.uuid4().hex
             event = IngestionEvent(event_id, task_id, document_id, version_id, bucket, key, source_version,
-                                   self.pipeline_version, source_uri, metadata=metadata)
+                                   self.pipeline_version, source_uri, metadata=metadata,
+                                   trace_context=self.observability.inject())
             persisted, _ = self.tasks.create_with_outbox(task, event_id, event.to_json())
             registered.append(persisted)
         return registered

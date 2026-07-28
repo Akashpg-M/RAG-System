@@ -32,8 +32,122 @@ services:
       - "127.0.0.1:6333:6333"
     volumes:
       - qdrant-data:/qdrant/storage
+  tempo:
+    image: grafana/tempo:2.7.2
+    profiles: [observability]
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "127.0.0.1:3200:3200"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3200/ready >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  loki:
+    image: grafana/loki:3.4.2
+    profiles: [observability]
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./observability/loki.yaml:/etc/loki/config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "127.0.0.1:3100:3100"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    profiles: [observability]
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    depends_on:
+      tempo:
+        condition: service_healthy
+  alloy:
+    image: grafana/alloy:v1.7.4
+    profiles: [observability]
+    command: ["run", "/etc/alloy/config.alloy", "--server.http.listen-addr=0.0.0.0:12345"]
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - //var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "127.0.0.1:12345:12345"
+    depends_on:
+      loki:
+        condition: service_healthy
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    profiles: [observability]
+    environment:
+      DATA_SOURCE_NAME: postgresql://rag:rag-local-only@postgres:5432/rag_control?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.69.0
+    profiles: [observability]
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.2
+    profiles: [observability]
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    ports:
+      - "127.0.0.1:8081:8080"
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    profiles: [observability]
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - cadvisor
+      - postgres-exporter
+      - redis-exporter
+  grafana:
+    image: grafana/grafana:11.5.2
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: rag-local-only
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
 
 volumes:
   redis-data:
   postgres-data:
   qdrant-data:
+  tempo-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import os
 import signal
 import threading
@@ -14,10 +13,18 @@ from src.infrastructure.repositories import (
     LocalFileObjectStorage, SQLiteDocumentRepository, SQLiteLeaseRepository, SQLiteTaskRepository,
 )
 from src.infrastructure.publication import SQLitePublicationRepository
+from src.observability import Observability, configure_json_logging, set_observability
 
 
 def build_worker() -> IngestionWorker:
     config = load_config(os.getenv("RAG_PROFILE", Profile.LOCAL.value))
+    observability = Observability(
+        "rag-worker", config.profile.value, config.observability.service_version,
+        config.pipeline.pipeline_version,
+        config.observability.otlp_endpoint if config.observability.enabled else "",
+        config.observability.sample_ratio,
+    )
+    set_observability(observability)
     application = build_application(config, include_queue=False)
     if config.queue.backend == "redis":
         import redis
@@ -44,7 +51,7 @@ def build_worker() -> IngestionWorker:
         )
     storage = LocalFileObjectStorage()
     cleanup = CleanupService(publication, documents, storage, application.ingestion)
-    return IngestionWorker(
+    worker = IngestionWorker(
         queue, tasks, documents, leases, storage, application,
         config.queue.worker_id, config.queue.max_concurrency, config.queue.poll_timeout_seconds,
         config.queue.lease_duration_seconds,
@@ -52,13 +59,19 @@ def build_worker() -> IngestionWorker:
         if config.queue.backend == "sqs" else config.queue.heartbeat_interval_seconds,
         config.queue.max_attempts, config.queue.retry_min_seconds, config.queue.retry_max_seconds,
         config.queue.shutdown_timeout_seconds,
-        publication, config.pipeline.graph_index_required, cleanup.run_once,
+        publication, config.pipeline.graph_index_required, cleanup.run_once, observability,
     )
+    worker.metrics_port = config.observability.worker_metrics_port
+    return worker
 
 
 def main() -> None:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    configure_json_logging("rag-worker", os.getenv("RAG_PROFILE", Profile.LOCAL.value),
+                           os.getenv("LOG_LEVEL", "INFO"))
     worker = build_worker()
+    if worker.metrics_port:
+        from prometheus_client import start_http_server
+        start_http_server(worker.metrics_port, registry=worker.observability.metrics.registry)
     stopping = threading.Event()
 
     def stop(*_: object) -> None:
@@ -72,6 +85,7 @@ def main() -> None:
         worker.run()
     finally:
         worker.queue.close()
+        worker.observability.shutdown()
 
 
 if __name__ == "__main__":

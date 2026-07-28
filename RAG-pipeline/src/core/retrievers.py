@@ -4,6 +4,7 @@ import hashlib
 from typing import Any, Dict, List, Optional
 
 from src.core.ports import CacheProvider, DenseIndex, EmbeddingProvider, GraphIndex, SparseIndex
+from src.observability import get_observability
 
 
 def candidate_matches(candidate: Dict[str, Any], filters: Optional[Dict[str, Any]]) -> bool:
@@ -33,6 +34,10 @@ class DenseRetriever:
     ) -> List[Dict[str, Any]]:
         query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
         query_vector = self.cache.get(query_hash)
+        telemetry = get_observability().metrics
+        telemetry.labels(
+            telemetry.cache_requests, cache="query", result="hit" if query_vector is not None else "miss"
+        ).inc()
         if query_vector is None:
             query_vector = self.embedder.get_embeddings_batched([query])[0]
             self.cache.set(query_hash, query_vector)

@@ -16,6 +16,7 @@ from src.core.ports import (
     GraphIndex,
     SparseIndex,
 )
+from src.observability import get_observability
 
 
 def stable_document_id(source_uri: str) -> str:
@@ -79,31 +80,37 @@ class IngestionService:
         version_id: Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> PreparedDocument:
+        telemetry = get_observability()
         source_path = Path(source_uri).resolve()
         if not source_path.is_file():
             raise FileNotFoundError(f"Document does not exist: {source_uri}")
         resolved_document_id = document_id or self.document_id_for(str(source_path))
         if progress_callback:
             progress_callback("PARSING")
-        parent_chunks, child_chunks = chunker.process_file(str(source_path), resolved_document_id)
+        with telemetry.span("ingestion.parsing"):
+            parent_chunks, child_chunks = chunker.process_file(str(source_path), resolved_document_id)
         if progress_callback:
             progress_callback("CHUNKING")
-        for parent in parent_chunks:
-            parent.metadata.setdefault("document_id", resolved_document_id)
-            if version_id:
-                parent.metadata.setdefault("version_id", version_id)
-        for child in child_chunks:
-            child.metadata.setdefault("document_id", resolved_document_id)
-            if version_id:
-                child.metadata.setdefault("version_id", version_id)
+        with telemetry.span("ingestion.chunking", {
+            "rag.parent_count": len(parent_chunks), "rag.chunk_count": len(child_chunks),
+        }):
+            for parent in parent_chunks:
+                parent.metadata.setdefault("document_id", resolved_document_id)
+                if version_id:
+                    parent.metadata.setdefault("version_id", version_id)
+            for child in child_chunks:
+                child.metadata.setdefault("document_id", resolved_document_id)
+                if version_id:
+                    child.metadata.setdefault("version_id", version_id)
 
         triples = []
         if self.graph_extraction_enabled:
-            for parent in parent_chunks:
-                for triple in self.extractor.extract_triples(parent.text):
-                    prepared = dict(triple)
-                    prepared["chunk_id"] = parent.parent_id
-                    triples.append(prepared)
+            with telemetry.span("ingestion.graph_extract"):
+                for parent in parent_chunks:
+                    for triple in self.extractor.extract_triples(parent.text):
+                        prepared = dict(triple)
+                        prepared["chunk_id"] = parent.parent_id
+                        triples.append(prepared)
 
         return PreparedDocument(resolved_document_id, version_id, parent_chunks, child_chunks, triples)
 
@@ -130,6 +137,10 @@ class IngestionService:
         uncached_positions = []
         for position, chunk in enumerate(child_chunks):
             cached = self.cache.get(chunk.content_hash)
+            telemetry = get_observability().metrics
+            telemetry.labels(
+                telemetry.cache_requests, cache="embedding", result="hit" if cached is not None else "miss"
+            ).inc()
             if cached is None:
                 uncached_chunks.append(chunk)
                 uncached_positions.append(position)

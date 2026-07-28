@@ -31,6 +31,7 @@ class IngestionEvent:
     occurred_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     schema_version: str = EVENT_VERSION
     metadata: Dict[str, Any] = field(default_factory=dict)
+    trace_context: Dict[str, str] = field(default_factory=dict)
 
     @property
     def idempotency_key(self) -> str:

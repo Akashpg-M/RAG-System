@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from src.core.ports import FusionStrategy, QueryProcessor, RerankingProvider, Retriever
+from src.observability import get_observability
 
 logger = logging.getLogger("AgenticRetrievalEngine")
 
@@ -34,14 +37,30 @@ class RetrieverManager:
             jobs.append(("graph", self.graph, semantic_payload["original_query"]))
         if not jobs:
             raise ValueError(f"Unsupported retrieval mode: {mode}")
+        telemetry = get_observability()
+
+        def retrieve(name: str, retriever: Retriever, query: str) -> List[Dict[str, Any]]:
+            started = time.perf_counter()
+            with telemetry.span(f"query.retrieve.{name}", {"rag.retriever": name}):
+                result = retriever.retrieve(query, top_k, filters)
+            elapsed = time.perf_counter() - started
+            telemetry.metrics.labels(telemetry.metrics.retrieval_duration, retriever=name).observe(elapsed)
+            telemetry.metrics.labels(telemetry.metrics.candidates_returned, retriever=name).observe(len(result))
+            return result
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as executor:
-            futures = [(name, executor.submit(retriever.retrieve, query, top_k, filters)) for name, retriever, query in jobs]
+            # Each branch receives an independent copy of the caller's OTEL context. This
+            # makes the retrievers overlapping siblings even though they run in threads.
+            futures = [
+                (name, executor.submit(contextvars.copy_context().run, retrieve, name, retriever, query))
+                for name, retriever, query in jobs
+            ]
             results = []
             for name, future in futures:
                 try:
                     results.append(future.result())
                 except Exception:
-                    logger.exception("Retriever %s failed; continuing with remaining indexes", name)
+                    logger.exception("retriever_failed", extra={"component": name, "error_code": "retrieval"})
                     results.append([])
         return results
 
@@ -70,20 +89,28 @@ class RetrievalService:
         filters: Optional[Dict[str, Any]] = None,
         mode: str = "hybrid",
     ) -> List[Dict[str, Any]]:
-        semantic_data = dict(self.processor.process_query(query_text))
+        telemetry = get_observability()
+        with telemetry.span("query.representations"):
+            semantic_data = dict(self.processor.process_query(query_text))
         matrices = self.manager.execute_routing(
             semantic_data, top_k=max(self.candidate_top_k, top_k), filters=filters, mode=mode
         )
-        fused_pool = self.fusion.fuse(matrices)
+        started = time.perf_counter()
+        with telemetry.span("query.fusion"):
+            fused_pool = self.fusion.fuse(matrices)
+        telemetry.metrics.labels(telemetry.metrics.fusion_duration).observe(time.perf_counter() - started)
         if not fused_pool:
             return []
         candidate_pool = fused_pool[:top_k * self.rerank_pool_multiplier]
         pairs = [[query_text, candidate["text"]] for candidate in candidate_pool]
         try:
-            predictions = self.reranker.predict(pairs)
+            started = time.perf_counter()
+            with telemetry.span("query.rerank", {"rag.candidate_count": len(candidate_pool)}):
+                predictions = self.reranker.predict(pairs)
+            telemetry.metrics.labels(telemetry.metrics.rerank_duration).observe(time.perf_counter() - started)
             scores = predictions.tolist() if hasattr(predictions, "tolist") else list(predictions)
         except Exception:
-            logger.exception("Cross-encoder reranking failed; returning RRF-ranked candidates")
+            logger.exception("reranking_failed", extra={"component": "reranker", "error_code": "retrieval"})
             return candidate_pool[:top_k]
         for candidate, score in zip(candidate_pool, scores):
             candidate["rerank_score"] = float(score)

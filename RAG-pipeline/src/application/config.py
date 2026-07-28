@@ -151,6 +151,17 @@ class PublicationSettings(BaseModel):
     staging_abandon_seconds: int = Field(default=3600, gt=0)
 
 
+class ObservabilitySettings(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    enabled: bool = True
+    otlp_endpoint: str = "http://127.0.0.1:4317"
+    sample_ratio: float = Field(default=1.0, ge=0, le=1)
+    service_version: str = "5.0.0"
+    worker_metrics_port: int = Field(default=9465, gt=1024, lt=65536)
+    dispatcher_metrics_port: int = Field(default=9466, gt=1024, lt=65536)
+    queue_sample_interval_seconds: float = Field(default=5, gt=0, le=60)
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
     profile: Profile = Profile.LOCAL
@@ -161,6 +172,7 @@ class AppConfig(BaseModel):
     api: ApiSettings = Field(default_factory=ApiSettings)
     queue: QueueSettings = Field(default_factory=QueueSettings)
     publication: PublicationSettings = Field(default_factory=PublicationSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 
 
 def profile_config(profile: Profile | str, root: Optional[Path] = None) -> AppConfig:
@@ -184,6 +196,7 @@ def profile_config(profile: Profile | str, root: Optional[Path] = None) -> AppCo
             pipeline=PipelineSettings(enable_hyde=False, enable_graph_extraction=False),
             api=ApiSettings(api_key="test-api-key", max_upload_bytes=1024 * 1024, rate_limit_requests=1000),
             queue=QueueSettings(backend="memory"),
+            observability=ObservabilitySettings(enabled=False, otlp_endpoint="", sample_ratio=1),
         )
     if selected is Profile.BENCHMARK:
         return AppConfig(
@@ -269,8 +282,20 @@ def load_config(profile: Profile | str = Profile.LOCAL, environ: Optional[Mappin
             "STAGING_ABANDON_SECONDS", base.publication.staging_abandon_seconds
         )),
     })
+    observability = ObservabilitySettings(**{
+        **base.observability.model_dump(),
+        "enabled": values.get("OBSERVABILITY_ENABLED", str(base.observability.enabled)).lower()
+        in ("1", "true", "yes"),
+        "otlp_endpoint": values.get("OTEL_EXPORTER_OTLP_ENDPOINT", base.observability.otlp_endpoint),
+        "sample_ratio": float(values.get("OTEL_TRACES_SAMPLER_RATIO", base.observability.sample_ratio)),
+        "worker_metrics_port": int(values.get("WORKER_METRICS_PORT", base.observability.worker_metrics_port)),
+        "dispatcher_metrics_port": int(values.get(
+            "DISPATCHER_METRICS_PORT", base.observability.dispatcher_metrics_port
+        )),
+    })
     return AppConfig(
         profile=base.profile, providers=base.providers, storage=storage, models=models, pipeline=pipeline, api=api,
         queue=queue,
         publication=publication,
+        observability=observability,
     )

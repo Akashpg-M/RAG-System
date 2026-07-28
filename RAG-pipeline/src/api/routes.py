@@ -20,7 +20,8 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 def protected(request: Request, _: Optional[str] = Security(api_key_header)) -> None:
-    request.app.state.security.authorize(request)
+    with request.app.state.observability.span("api.authentication"):
+        request.app.state.security.authorize(request)
 
 
 router = APIRouter()

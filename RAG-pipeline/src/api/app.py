@@ -24,14 +24,34 @@ from src.infrastructure.repositories import (
     LocalFileObjectStorage, SQLiteDocumentRepository, SQLiteLeaseRepository, SQLiteTaskRepository,
 )
 from src.infrastructure.publication import SQLitePublicationRepository
+from src.observability import (
+    Observability, configure_json_logging, reset_request_id, set_observability, set_request_id,
+)
 
 
 def create_api(
     config: Optional[AppConfig] = None,
     rag_application: Optional[RagApplication] = None,
     readiness_probes: Optional[Iterable[Tuple[str, Any, bool]]] = None,
+    observability: Optional[Observability] = None,
+    dispatcher_observability: Optional[Observability] = None,
 ) -> FastAPI:
     settings = config or load_config(os.getenv("RAG_PROFILE", Profile.LOCAL.value))
+    telemetry = observability or Observability(
+        "rag-api", settings.profile.value, settings.observability.service_version,
+        settings.pipeline.pipeline_version,
+        settings.observability.otlp_endpoint if settings.observability.enabled else "",
+        settings.observability.sample_ratio,
+    )
+    dispatcher_telemetry = dispatcher_observability or Observability(
+        "rag-outbox-dispatcher", settings.profile.value, settings.observability.service_version,
+        settings.pipeline.pipeline_version,
+        settings.observability.otlp_endpoint if settings.observability.enabled else "",
+        settings.observability.sample_ratio,
+    )
+    set_observability(telemetry)
+    if settings.profile is not Profile.TEST:
+        configure_json_logging("rag-api", settings.profile.value, os.getenv("LOG_LEVEL", "INFO"))
     rag = rag_application or build_application(settings, include_queue=False)
     if settings.queue.backend == "memory":
         work_queue = InMemoryIngestionQueue(settings.queue.capacity)
@@ -65,8 +85,8 @@ def create_api(
             settings.storage.control_database_url, settings.publication.retention_versions
         )
         documents = tasks = leases = publication = control
-    metrics = ApiMetrics(lambda: work_queue.stats().depth, work_queue.stats, publication.stats)
-    dispatcher = OutboxDispatcher(tasks, work_queue)
+    metrics = ApiMetrics(lambda: work_queue.stats().depth, work_queue.stats, publication.stats, telemetry)
+    dispatcher = OutboxDispatcher(tasks, work_queue, dispatcher_telemetry)
     document_service = DocumentControlService(
         rag, settings, storage, documents, tasks, work_queue, metrics, dispatcher, publication
     )
@@ -82,10 +102,22 @@ def create_api(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         stop_dispatch = threading.Event()
+        dispatcher_server = None
+        if settings.profile is not Profile.TEST and settings.observability.dispatcher_metrics_port:
+            try:
+                from prometheus_client import start_http_server
+                dispatcher_server, _ = start_http_server(
+                    settings.observability.dispatcher_metrics_port,
+                    registry=dispatcher_telemetry.metrics.registry,
+                )
+            except OSError:
+                dispatcher_server = None
         def dispatch_loop():
-            while not stop_dispatch.wait(1.0):
+            while not stop_dispatch.wait(settings.observability.queue_sample_interval_seconds):
+                metrics.sample_dependencies()
                 dispatcher.reconcile_queued(documents, settings.pipeline.pipeline_version)
                 dispatcher.dispatch_once()
+        metrics.sample_dependencies()
         dispatcher.reconcile_queued(documents, settings.pipeline.pipeline_version)
         dispatcher.dispatch_once()
         dispatch_thread = threading.Thread(target=dispatch_loop, daemon=True, name="outbox-dispatcher")
@@ -111,6 +143,10 @@ def create_api(
         work_queue.close()
         if rag.queue and hasattr(rag.queue, "shutdown"):
             rag.queue.shutdown()
+        telemetry.shutdown()
+        dispatcher_telemetry.shutdown()
+        if dispatcher_server:
+            dispatcher_server.shutdown()
 
     app = FastAPI(
         title="Multi-Index RAG API",
@@ -125,11 +161,13 @@ def create_api(
     app.state.document_service = document_service
     app.state.query_service = query_service
     app.state.readiness_service = readiness_service
+    app.state.observability = telemetry
 
     @app.middleware("http")
     async def operational_middleware(request: Request, call_next):
         started = time.perf_counter()
         request.state.trace_id = uuid.uuid4().hex
+        token = set_request_id(request.state.trace_id)
         limit = (
             settings.api.max_upload_bytes
             if request.url.path == "/api/v1/documents/upload"
@@ -137,19 +175,25 @@ def create_api(
         )
         content_length = request.headers.get("content-length")
         multipart_overhead = 64 * 1024 if request.url.path == "/api/v1/documents/upload" else 0
-        if content_length and content_length.isdigit() and int(content_length) > limit + multipart_overhead:
-            response = JSONResponse(
-                status_code=413,
-                content={
-                    "error": "request_too_large", "message": "Request exceeds the configured size limit",
-                    "trace_id": request.state.trace_id,
-                },
+        try:
+            if content_length and content_length.isdigit() and int(content_length) > limit + multipart_overhead:
+                response = JSONResponse(
+                    status_code=413,
+                    content={
+                        "error": "request_too_large", "message": "Request exceeds the configured size limit",
+                        "trace_id": request.state.trace_id,
+                    },
+                )
+            else:
+                with telemetry.span("api.request", {"http.route": normalized_path(request.url.path)}):
+                    response = await call_next(request)
+            response.headers["X-Trace-ID"] = request.state.trace_id
+            metrics.record_request(
+                request.url.path, request.method, response.status_code, time.perf_counter() - started
             )
-        else:
-            response = await call_next(request)
-        response.headers["X-Trace-ID"] = request.state.trace_id
-        metrics.record_request(request.url.path, request.method, response.status_code, time.perf_counter() - started)
-        return response
+            return response
+        finally:
+            reset_request_id(token)
 
     @app.exception_handler(ApiError)
     async def api_error_handler(request: Request, error: ApiError):
@@ -183,4 +227,16 @@ def create_api(
         )
 
     app.include_router(router)
+    if telemetry.provider:
+        try:
+            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+            FastAPIInstrumentor.instrument_app(app, tracer_provider=telemetry.provider,
+                                               excluded_urls="/health,/ready,/metrics")
+        except Exception:
+            pass
     return app
+
+
+def normalized_path(path: str) -> str:
+    from src.api.metrics import normalized_route
+    return normalized_route(path)

@@ -53,8 +53,10 @@ class SemanticQueryProcessor:
                 "rewritten_query": data.get("rewritten_query", raw_query),
                 "hyde_document": data.get("hyde_document", raw_query)
             }
-        except Exception as e:
-            logger.error(f"Semantic API failure: {str(e)}. Falling back to raw representations.")
+        except Exception:
+            logger.error("query_representation_failed", extra={
+                "component": "semantic_processor", "error_code": "generation", "outcome": "degraded",
+            })
             return {
                 "original_query": raw_query,
                 "rewritten_query": raw_query,
