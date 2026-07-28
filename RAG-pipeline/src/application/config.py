@@ -26,7 +26,7 @@ class ProviderSettings(BaseModel):
     query_processor: str = "groq"
     answer_generator: str = "groq"
     cache: str = "sqlite"
-    queue: str = "thread"
+    queue: str = "redis"
     object_storage: str = "local"
     document_repository: str = "sqlite"
     task_repository: str = "sqlite"
@@ -102,6 +102,40 @@ class ApiSettings(BaseModel):
         return self
 
 
+class QueueSettings(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    backend: str = "redis"
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    stream_name: str = "rag:ingestion"
+    consumer_group: str = "rag-workers"
+    worker_id: str = "worker-1"
+    max_concurrency: int = Field(default=2, gt=0, le=64)
+    poll_timeout_seconds: float = Field(default=5, gt=0, le=20)
+    lease_duration_seconds: float = Field(default=120, gt=1)
+    heartbeat_interval_seconds: float = Field(default=30, gt=0)
+    visibility_timeout_seconds: int = Field(default=120, gt=1, le=43200)
+    visibility_heartbeat_seconds: float = Field(default=30, gt=0)
+    max_attempts: int = Field(default=5, gt=0)
+    retry_min_seconds: float = Field(default=1, ge=0)
+    retry_max_seconds: float = Field(default=300, gt=0)
+    capacity: int = Field(default=10000, gt=0)
+    shutdown_timeout_seconds: float = Field(default=30, gt=0)
+    sqs_queue_url: str = ""
+    sqs_dlq_url: str = ""
+
+    @model_validator(mode="after")
+    def validate_safety(self) -> "QueueSettings":
+        if self.heartbeat_interval_seconds >= self.lease_duration_seconds:
+            raise ValueError("lease heartbeat must be smaller than lease duration")
+        if self.visibility_heartbeat_seconds >= self.visibility_timeout_seconds:
+            raise ValueError("visibility heartbeat must be smaller than visibility timeout")
+        if self.retry_min_seconds > self.retry_max_seconds:
+            raise ValueError("retry minimum must not exceed retry maximum")
+        if self.backend == "sqs" and (not self.sqs_queue_url or not self.sqs_dlq_url):
+            raise ValueError("SQS queue URL and DLQ URL are required")
+        return self
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
     profile: Profile = Profile.LOCAL
@@ -110,6 +144,7 @@ class AppConfig(BaseModel):
     models: ModelSettings = Field(default_factory=ModelSettings)
     pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
     api: ApiSettings = Field(default_factory=ApiSettings)
+    queue: QueueSettings = Field(default_factory=QueueSettings)
 
 
 def profile_config(profile: Profile | str, root: Optional[Path] = None) -> AppConfig:
@@ -132,6 +167,7 @@ def profile_config(profile: Profile | str, root: Optional[Path] = None) -> AppCo
             ),
             pipeline=PipelineSettings(enable_hyde=False, enable_graph_extraction=False),
             api=ApiSettings(api_key="test-api-key", max_upload_bytes=1024 * 1024, rate_limit_requests=1000),
+            queue=QueueSettings(backend="memory"),
         )
     if selected is Profile.BENCHMARK:
         return AppConfig(
@@ -145,6 +181,8 @@ def profile_config(profile: Profile | str, root: Optional[Path] = None) -> AppCo
         return AppConfig(
             profile=selected,
             providers=ProviderSettings(queue="aws_future", cache="memory"),
+            queue=QueueSettings(backend="sqs", sqs_queue_url="https://sqs.invalid/queue",
+                                sqs_dlq_url="https://sqs.invalid/dlq"),
             pipeline=PipelineSettings(provider_timeout_seconds=60.0),
         )
     return AppConfig(profile=selected)
@@ -183,6 +221,24 @@ def load_config(profile: Profile | str = Profile.LOCAL, environ: Optional[Mappin
         "max_upload_bytes": int(values.get("MAX_UPLOAD_BYTES", base.api.max_upload_bytes)),
         "rate_limit_requests": int(values.get("RATE_LIMIT_REQUESTS", base.api.rate_limit_requests)),
     })
+    queue = QueueSettings(**{
+        **base.queue.model_dump(),
+        "backend": values.get("INGESTION_QUEUE_BACKEND", base.queue.backend),
+        "redis_url": values.get("REDIS_URL", base.queue.redis_url),
+        "stream_name": values.get("INGESTION_STREAM", base.queue.stream_name),
+        "consumer_group": values.get("INGESTION_CONSUMER_GROUP", base.queue.consumer_group),
+        "worker_id": values.get("INGESTION_WORKER_ID", base.queue.worker_id),
+        "max_concurrency": int(values.get("INGESTION_MAX_CONCURRENCY", base.queue.max_concurrency)),
+        "lease_duration_seconds": float(values.get("INGESTION_LEASE_SECONDS", base.queue.lease_duration_seconds)),
+        "heartbeat_interval_seconds": float(values.get("INGESTION_HEARTBEAT_SECONDS", base.queue.heartbeat_interval_seconds)),
+        "visibility_timeout_seconds": int(values.get("SQS_VISIBILITY_TIMEOUT", base.queue.visibility_timeout_seconds)),
+        "visibility_heartbeat_seconds": float(values.get("SQS_VISIBILITY_HEARTBEAT", base.queue.visibility_heartbeat_seconds)),
+        "max_attempts": int(values.get("INGESTION_MAX_ATTEMPTS", base.queue.max_attempts)),
+        "capacity": int(values.get("INGESTION_QUEUE_CAPACITY", base.queue.capacity)),
+        "sqs_queue_url": values.get("SQS_QUEUE_URL", base.queue.sqs_queue_url),
+        "sqs_dlq_url": values.get("SQS_DLQ_URL", base.queue.sqs_dlq_url),
+    })
     return AppConfig(
-        profile=base.profile, providers=base.providers, storage=storage, models=models, pipeline=pipeline, api=api
+        profile=base.profile, providers=base.providers, storage=storage, models=models, pipeline=pipeline, api=api,
+        queue=queue,
     )

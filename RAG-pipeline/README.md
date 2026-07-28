@@ -87,6 +87,24 @@ python -m src.api
 
 The first local start may download Docling and SentenceTransformer/cross-encoder artifacts. Runtime data is written to ignored local Qdrant, SQLite, cache, and upload paths.
 
+### Durable ingestion worker
+
+Stage 3 runs upload ingestion outside the API. Start Redis, the API, and one or more
+workers in separate terminals:
+
+```powershell
+docker compose up -d redis
+python -m src.api
+python -m src.worker
+```
+
+The local backend uses Redis Streams and consumer groups. Upload acceptance persists a
+task plus outbox intent before returning `202`; workers acknowledge only after `READY`,
+recover abandoned pending entries, renew persistent leases, use scheduled delayed
+retries, and route terminal failures to a separate DLQ stream. Set
+`INGESTION_QUEUE_BACKEND=sqs`, `SQS_QUEUE_URL`, and `SQS_DLQ_URL` to select SQS Standard.
+SQS infrastructure provisioning and live-AWS tests are intentionally deferred.
+
 ## API endpoints
 
 ```text
@@ -111,4 +129,3 @@ python -m compileall -q src tests
 ```
 
 The suite uses deterministic providers and temporary storage. It does not call Groq or download models, while retaining the temporary local Qdrant/SQLite compatibility test.
-

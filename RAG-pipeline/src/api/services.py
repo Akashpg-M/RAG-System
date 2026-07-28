@@ -27,15 +27,23 @@ from src.api.validation import UploadValidator
 from src.application.composition import RagApplication
 from src.application.config import AppConfig
 from src.core.contracts import DocumentVersion, IndexingStatus, IngestionTask
+from src.core.events import IngestionEvent, idempotency_key
 from src.core.ports import DocumentChunker, DocumentRepository, ObjectStorage, TaskRepository
-from src.infrastructure.task_queue import BackgroundWorkQueue
+from src.application.ingestion_runtime import OutboxDispatcher
+from src.core.queue import IngestionQueue
 
 
 ALLOWED_TRANSITIONS = {
     IndexingStatus.UPLOADING: {IndexingStatus.QUEUED, IndexingStatus.FAILED_PERMANENT},
     IndexingStatus.QUEUED: {IndexingStatus.PARSING, IndexingStatus.DELETE_PENDING, IndexingStatus.FAILED_RETRYABLE},
-    IndexingStatus.PARSING: {IndexingStatus.CHUNKING, IndexingStatus.DELETE_PENDING, IndexingStatus.FAILED_PERMANENT},
-    IndexingStatus.CHUNKING: {IndexingStatus.EMBEDDING, IndexingStatus.DELETE_PENDING, IndexingStatus.FAILED_PERMANENT},
+    IndexingStatus.PARSING: {
+        IndexingStatus.CHUNKING, IndexingStatus.DELETE_PENDING,
+        IndexingStatus.FAILED_RETRYABLE, IndexingStatus.FAILED_PERMANENT,
+    },
+    IndexingStatus.CHUNKING: {
+        IndexingStatus.EMBEDDING, IndexingStatus.DELETE_PENDING,
+        IndexingStatus.FAILED_RETRYABLE, IndexingStatus.FAILED_PERMANENT,
+    },
     IndexingStatus.EMBEDDING: {
         IndexingStatus.INDEXING_DENSE, IndexingStatus.READY, IndexingStatus.DELETE_PENDING,
         IndexingStatus.FAILED_RETRYABLE, IndexingStatus.FAILED_PERMANENT,
@@ -110,8 +118,9 @@ class DocumentControlService:
         storage: ObjectStorage,
         documents: DocumentRepository,
         tasks: TaskRepository,
-        queue: BackgroundWorkQueue,
+        queue: IngestionQueue,
         metrics: ApiMetrics,
+        outbox: Optional[OutboxDispatcher] = None,
     ):
         self.application = application
         self.config = config
@@ -120,6 +129,7 @@ class DocumentControlService:
         self.tasks = tasks
         self.queue = queue
         self.metrics = metrics
+        self.outbox = outbox
         self.validator = UploadValidator(config.api)
         self.lifecycle = LifecycleController(tasks)
         self._document_locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
@@ -140,6 +150,16 @@ class DocumentControlService:
         content_hash = hashlib.sha256(data).hexdigest()
         version_id = hashlib.sha256(f"{document_id}\0{content_hash}".encode("utf-8")).hexdigest()[:16]
         source_uri = str(Path(self.config.storage.upload_path).resolve() / document_id / version_id / safe_name)
+        namespace = "local"
+        pipeline_version = self.config.api.config_version
+        key = idempotency_key(namespace, source_uri, content_hash, pipeline_version)
+        find_existing = getattr(self.tasks, "get_by_idempotency_key", None)
+        existing = find_existing(key) if find_existing else None
+        if existing and existing.document_id and existing.version_id:
+            return UploadResponse(
+                document_id=existing.document_id, version_id=existing.version_id, task_id=existing.task_id,
+                status=existing.status, status_url=status_url_template.format(task_id=existing.task_id), upload=None,
+            )
         task_id = uuid.uuid4().hex
         now = datetime.now(timezone.utc)
         task = IngestionTask(
@@ -147,10 +167,10 @@ class DocumentControlService:
             status=IndexingStatus.UPLOADING, created_at=now, updated_at=now,
             history=[IndexingStatus.UPLOADING],
         )
-        self.tasks.save(task)
         try:
             self.storage.put_bytes(source_uri, data, content_type)
         except Exception as error:
+            self.tasks.save(task)
             self.lifecycle.transition(task_id, IndexingStatus.FAILED_PERMANENT, "storage_write_failed")
             raise ApiError(503, "storage_unavailable", "Document storage is unavailable") from error
 
@@ -160,8 +180,24 @@ class DocumentControlService:
         }
         version = DocumentVersion(document_id, version_id, source_uri, content_hash, now, version_metadata)
         self.documents.save(version)
-        self.lifecycle.transition(task_id, IndexingStatus.QUEUED)
-        self.queue.enqueue(lambda: self._process(task_id, version))
+        task = replace(task, status=IndexingStatus.QUEUED, history=[IndexingStatus.UPLOADING, IndexingStatus.QUEUED],
+                       updated_at=datetime.now(timezone.utc))
+        task = replace(task, idempotency_key=key)
+        event_id = uuid.uuid4().hex
+        event = IngestionEvent(
+            event_id, task_id, document_id, version_id, namespace, source_uri, content_hash,
+            pipeline_version, source_uri, metadata=version_metadata,
+        )
+        create = getattr(self.tasks, "create_with_outbox", None)
+        if not create:
+            raise RuntimeError("task repository does not support durable publication")
+        persisted, created = create(task, event_id, event.to_json())
+        if not created:
+            task_id = persisted.task_id
+            document_id = persisted.document_id or document_id
+            version_id = persisted.version_id or version_id
+        if self.outbox:
+            self.outbox.dispatch_once()
         self.metrics.increment("uploads_total")
         self.metrics.increment("ingestion_tasks_total")
         return UploadResponse(

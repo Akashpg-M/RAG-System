@@ -97,6 +97,9 @@ class IngestionTask:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     history: List[IndexingStatus] = field(default_factory=list)
+    attempt_count: int = 0
+    idempotency_key: Optional[str] = None
+    fencing_token: int = 0
 
 
 @dataclass

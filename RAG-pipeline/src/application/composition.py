@@ -91,9 +91,6 @@ def build_in_memory_application(
 
 
 def build_local_application(config: AppConfig, include_queue: bool = True) -> RagApplication:
-    if config.profile is Profile.AWS_DEMO:
-        raise NotImplementedError("AWS adapters are intentionally deferred; the profile only reserves validated settings")
-
     import tiktoken
     from groq import Groq
 

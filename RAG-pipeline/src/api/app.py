@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import uuid
 import os
+import threading
 from contextlib import asynccontextmanager
 from typing import Any, Iterable, Optional, Tuple
 
@@ -17,9 +18,11 @@ from src.api.security import ApiSecurity
 from src.api.services import DocumentControlService, QueryApplicationService, ReadinessService
 from src.application.composition import RagApplication, build_application
 from src.application.config import AppConfig, Profile, load_config
-from src.infrastructure.memory import InMemoryDocumentRepository, InMemoryTaskRepository
-from src.infrastructure.repositories import LocalFileObjectStorage, SQLiteDocumentRepository, SQLiteTaskRepository
-from src.infrastructure.task_queue import BackgroundWorkQueue
+from src.application.ingestion_runtime import IngestionWorker, OutboxDispatcher
+from src.infrastructure.ingestion_queues import InMemoryIngestionQueue, RedisStreamsQueue, SQSQueue
+from src.infrastructure.repositories import (
+    LocalFileObjectStorage, SQLiteDocumentRepository, SQLiteLeaseRepository, SQLiteTaskRepository,
+)
 
 
 def create_api(
@@ -29,28 +32,69 @@ def create_api(
 ) -> FastAPI:
     settings = config or load_config(os.getenv("RAG_PROFILE", Profile.LOCAL.value))
     rag = rag_application or build_application(settings, include_queue=False)
-    work_queue = BackgroundWorkQueue()
-    metrics = ApiMetrics(work_queue.depth)
-    storage = LocalFileObjectStorage()
-    if settings.profile is Profile.TEST:
-        documents = InMemoryDocumentRepository()
-        tasks = InMemoryTaskRepository()
+    if settings.queue.backend == "memory":
+        work_queue = InMemoryIngestionQueue(settings.queue.capacity)
+    elif settings.queue.backend == "redis":
+        try:
+            import redis
+        except ImportError as error:
+            raise RuntimeError("Redis queue selected; install the 'redis' package") from error
+        work_queue = RedisStreamsQueue(redis.Redis.from_url(settings.queue.redis_url), settings.queue.stream_name,
+                                       settings.queue.consumer_group, f"api-{os.getpid()}", settings.queue.capacity)
+    elif settings.queue.backend == "sqs":
+        try:
+            import boto3
+        except ImportError as error:
+            raise RuntimeError("SQS queue selected; install the 'boto3' package") from error
+        work_queue = SQSQueue(boto3.client("sqs"), settings.queue.sqs_queue_url, settings.queue.sqs_dlq_url,
+                              settings.queue.visibility_timeout_seconds, settings.queue.capacity)
     else:
-        documents = SQLiteDocumentRepository(settings.storage.control_db_path)
-        tasks = SQLiteTaskRepository(settings.storage.control_db_path)
-    document_service = DocumentControlService(rag, settings, storage, documents, tasks, work_queue, metrics)
+        raise ValueError(f"Unsupported ingestion queue backend: {settings.queue.backend}")
+    metrics = ApiMetrics(lambda: work_queue.stats().depth, work_queue.stats)
+    storage = LocalFileObjectStorage()
+    documents = SQLiteDocumentRepository(settings.storage.control_db_path)
+    tasks = SQLiteTaskRepository(settings.storage.control_db_path)
+    leases = SQLiteLeaseRepository(settings.storage.control_db_path)
+    dispatcher = OutboxDispatcher(tasks, work_queue)
+    document_service = DocumentControlService(rag, settings, storage, documents, tasks, work_queue, metrics, dispatcher)
     query_service = QueryApplicationService(rag, settings, documents, metrics)
     probes = list(readiness_probes) if readiness_probes is not None else [
         ("dense_index", rag.ingestion.vector_store, True),
         ("sparse_index", rag.ingestion.sparse_store, True),
         ("graph_index", rag.ingestion.graph_store, settings.pipeline.enable_graph_extraction),
+        ("task_repository", tasks, True), ("object_storage", storage, True), ("ingestion_queue", work_queue, True),
     ]
     readiness_service = ReadinessService(probes, min(settings.pipeline.provider_timeout_seconds, 5.0))
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        stop_dispatch = threading.Event()
+        def dispatch_loop():
+            while not stop_dispatch.wait(1.0):
+                dispatcher.reconcile_queued(documents, settings.api.config_version)
+                dispatcher.dispatch_once()
+        dispatcher.reconcile_queued(documents, settings.api.config_version)
+        dispatcher.dispatch_once()
+        dispatch_thread = threading.Thread(target=dispatch_loop, daemon=True, name="outbox-dispatcher")
+        dispatch_thread.start()
+        embedded_worker = None
+        worker_thread = None
+        if settings.profile is Profile.TEST:
+            embedded_worker = IngestionWorker(
+                work_queue, tasks, documents, leases, storage, rag, "test-worker", max_concurrency=2,
+                poll_timeout=0.05, lease_duration=5, heartbeat_interval=1, max_attempts=2,
+                retry_min=0, retry_max=0, shutdown_timeout=2,
+            )
+            worker_thread = threading.Thread(target=embedded_worker.run, daemon=True, name="test-ingestion-worker")
+            worker_thread.start()
         yield
-        work_queue.shutdown()
+        stop_dispatch.set()
+        dispatch_thread.join(timeout=2)
+        if embedded_worker:
+            embedded_worker.stop()
+        if worker_thread:
+            worker_thread.join(timeout=3)
+        work_queue.close()
         if rag.queue and hasattr(rag.queue, "shutdown"):
             rag.queue.shutdown()
 
