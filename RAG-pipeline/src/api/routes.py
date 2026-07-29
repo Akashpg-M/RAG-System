@@ -34,8 +34,11 @@ router = APIRouter()
     dependencies=[Depends(protected)],
     tags=["query"],
 )
-def query(request_body: QueryRequest, request: Request) -> QueryResponse:
-    return request.app.state.query_service.execute(request_body, request.state.trace_id)
+async def query(request_body: QueryRequest, request: Request) -> QueryResponse:
+    return await request.app.state.query_runtime.execute(
+        request.app.state.query_service.execute, request_body, request.state.trace_id,
+        request.state.authorization_scope,
+    )
 
 
 @router.post(

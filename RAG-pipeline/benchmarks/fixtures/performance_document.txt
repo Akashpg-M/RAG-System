@@ -1,0 +1,3 @@
+The local RAG runtime uses PostgreSQL as its publication control plane and Redis Streams for durable ingestion delivery.
+Queries filter candidates against an immutable publication snapshot before generation.
+Stage 6 uses bounded concurrency, monotonic deadlines, versioned caches, and provider circuit breakers.

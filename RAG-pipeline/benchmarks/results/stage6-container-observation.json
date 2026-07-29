@@ -1,0 +1,71 @@
+{
+  "schema_version": "1.0",
+  "observed_at_utc": "2026-07-28T18:50:00Z",
+  "docker_desktop_limits": {
+    "cpus": 2,
+    "memory_bytes": 4111769600
+  },
+  "application_limits": {
+    "api_memory": "2GiB",
+    "worker_memory": "2GiB",
+    "dispatcher_memory": "384MiB"
+  },
+  "observed_initialization_memory_mib": {
+    "api": 749.3,
+    "worker": 691.9,
+    "dispatcher": 60.51
+  },
+  "health": {
+    "api": "healthy",
+    "worker": "healthy",
+    "dispatcher": "healthy"
+  },
+  "prometheus_targets": {
+    "api:8000": "up",
+    "worker:9465": "up",
+    "dispatcher:9466": "up",
+    "cadvisor:8080": "up"
+  },
+  "post_restart_prometheus": {
+    "target_metadata": "up",
+    "sample_ingestion": "out_of_order_rejected",
+    "cause": "Docker Desktop clock resynchronization left future-dated samples in the persistent local TSDB volume.",
+    "application_impact": "none",
+    "remediation_not_applied": "The persistent telemetry volume was preserved rather than destructively reset."
+  },
+  "distributed_ingestion_trace": {
+    "trace_id": "3bcc32c0358babefe69e35099d0ec828",
+    "services": ["rag-api", "rag-outbox-dispatcher", "rag-worker"],
+    "confirmed_stages": [
+      "ingestion.durable_task_outbox",
+      "outbox.publish",
+      "ingestion.process",
+      "ingestion.parsing",
+      "ingestion.embedding",
+      "ingestion.index.dense",
+      "ingestion.index.sparse",
+      "ingestion.index.graph",
+      "ingestion.atomic_activation",
+      "queue.acknowledge"
+    ]
+  },
+  "query_trace_log_correlation": {
+    "trace_id": "ec8c0395dee4adca4441a2b2281f7ea2",
+    "loki_correlated_records": 1,
+    "generation_provider_is_child_of_query_root": true,
+    "request_context_present_in_log": true,
+    "raw_query_observed": false
+  },
+  "separate_process_upload": {
+    "terminal_status": "READY",
+    "history": [
+      "UPLOADING", "QUEUED", "PARSING", "CHUNKING", "EMBEDDING",
+      "INDEXING_DENSE", "INDEXING_SPARSE", "INDEXING_GRAPH", "READY"
+    ]
+  },
+  "image_build": {
+    "result": "success_after_retry",
+    "cached_rebuild_seconds": 27.9,
+    "limitation": "The shared runtime image includes CUDA-capable PyTorch transitive packages and is larger than needed."
+  }
+}

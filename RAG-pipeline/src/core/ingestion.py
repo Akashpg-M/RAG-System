@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 from src.core.contracts import Vector
+from src.core.cache_keys import content_embedding_key
 from src.core.publication import PreparedDocument
 from src.core.ports import (
     CacheProvider,
@@ -36,6 +37,15 @@ class IngestionService:
         document_id_factory: Callable[[str], str] = stable_document_id,
         embedding_batch_size: int = 64,
         graph_extraction_enabled: bool = True,
+        embedding_model_version: str = "configured",
+        pipeline_version: str = "configured",
+        embedding_batch_max_tokens: int = 8192,
+        embedding_batch_max_bytes: int = 1_000_000,
+        embedding_memory_budget_bytes: int = 64_000_000,
+        parsing_concurrency: int = 2,
+        embedding_concurrency: int = 1,
+        graph_concurrency: int = 2,
+        index_concurrency: int = 2,
     ):
         self.sparse_store = sparse_index
         self.graph_store = graph_index
@@ -46,6 +56,17 @@ class IngestionService:
         self.document_id_factory = document_id_factory
         self.embedding_batch_size = embedding_batch_size
         self.graph_extraction_enabled = graph_extraction_enabled
+        self.embedding_model_version, self.pipeline_version = embedding_model_version, pipeline_version
+        self.embedding_batch_max_tokens = embedding_batch_max_tokens
+        self.embedding_batch_max_bytes = embedding_batch_max_bytes
+        self.embedding_memory_budget_bytes = embedding_memory_budget_bytes
+        from src.core.performance import Bulkhead
+        self.parsing_bulkhead = Bulkhead(parsing_concurrency, "parsing")
+        self.embedding_bulkhead = Bulkhead(embedding_concurrency, "ingestion-embedding")
+        self.graph_bulkhead = Bulkhead(graph_concurrency, "graph-extraction")
+        self.dense_bulkhead = Bulkhead(index_concurrency, "dense-index")
+        self.sparse_bulkhead = Bulkhead(index_concurrency, "sparse-index")
+        self.graph_index_bulkhead = Bulkhead(index_concurrency, "graph-index")
 
     def document_id_for(self, source_uri: str) -> str:
         return self.document_id_factory(source_uri)
@@ -88,7 +109,9 @@ class IngestionService:
         if progress_callback:
             progress_callback("PARSING")
         with telemetry.span("ingestion.parsing"):
-            parent_chunks, child_chunks = chunker.process_file(str(source_path), resolved_document_id)
+            parent_chunks, child_chunks = self.parsing_bulkhead.run(
+                chunker.process_file, str(source_path), resolved_document_id, timeout=30
+            )
         if progress_callback:
             progress_callback("CHUNKING")
         with telemetry.span("ingestion.chunking", {
@@ -107,7 +130,7 @@ class IngestionService:
         if self.graph_extraction_enabled:
             with telemetry.span("ingestion.graph_extract"):
                 for parent in parent_chunks:
-                    for triple in self.extractor.extract_triples(parent.text):
+                    for triple in self.graph_bulkhead.run(self.extractor.extract_triples, parent.text, timeout=30):
                         prepared = dict(triple)
                         prepared["chunk_id"] = parent.parent_id
                         triples.append(prepared)
@@ -136,11 +159,18 @@ class IngestionService:
         uncached_chunks = []
         uncached_positions = []
         for position, chunk in enumerate(child_chunks):
-            cached = self.cache.get(chunk.content_hash)
+            cache_key = content_embedding_key(
+                chunk.content_hash, self.embedding_model_version, self.pipeline_version
+            )
+            cached = self.cache.get(cache_key)
+            if cached is None and self.embedding_model_version == self.pipeline_version == "configured":
+                # Stage 0 compatibility only. Versioned runtime composition never reads legacy keys.
+                cached = self.cache.get(chunk.content_hash)
             telemetry = get_observability().metrics
-            telemetry.labels(
-                telemetry.cache_requests, cache="embedding", result="hit" if cached is not None else "miss"
-            ).inc()
+            if not getattr(self.cache, "records_metrics", False):
+                telemetry.labels(
+                    telemetry.cache_requests, cache="embedding", result="hit" if cached is not None else "miss"
+                ).inc()
             if cached is None:
                 uncached_chunks.append(chunk)
                 uncached_positions.append(position)
@@ -148,17 +178,24 @@ class IngestionService:
                 embeddings[position] = cached
 
         if uncached_chunks:
-            texts = [chunk.text for chunk in uncached_chunks]
-            try:
-                computed = self.embedder.get_embeddings_batched(texts, batch_size=self.embedding_batch_size)
-            except TypeError:
-                # Compatibility for Stage 0 providers that implemented the
-                # original single-argument method before the batch-size port.
-                computed = self.embedder.get_embeddings_batched(texts)
+            computed = []
+            for batch in self._embedding_batches(uncached_chunks):
+                texts = [chunk.text for chunk in batch]
+                try:
+                    values = self.embedding_bulkhead.run(
+                        self.embedder.get_embeddings_batched, texts, batch_size=self.embedding_batch_size,
+                        timeout=30,
+                    )
+                except TypeError:
+                    values = self.embedding_bulkhead.run(self.embedder.get_embeddings_batched, texts, timeout=30)
+                computed.extend(values)
             if len(computed) != len(uncached_chunks):
                 raise RuntimeError("Embedding provider returned an unexpected vector count")
             for position, chunk, vector in zip(uncached_positions, uncached_chunks, computed):
-                self.cache.set(chunk.content_hash, vector)
+                cache_key = content_embedding_key(
+                    chunk.content_hash, self.embedding_model_version, self.pipeline_version
+                )
+                self.cache.set(cache_key, vector)
                 embeddings[position] = vector
 
         final_embeddings = [embedding for embedding in embeddings if embedding is not None]
@@ -167,24 +204,50 @@ class IngestionService:
 
         prepared.embeddings = final_embeddings
 
+    def _embedding_batches(self, chunks: List[Any]) -> List[List[Any]]:
+        batches: List[List[Any]] = []
+        current: List[Any] = []
+        tokens = byte_count = estimated_memory = 0
+        for chunk in chunks:
+            encoded = chunk.text.encode("utf-8")
+            item_tokens = max(1, len(chunk.text) // 4)
+            item_memory = len(encoded) + 4096
+            exceeds = current and (
+                len(current) >= self.embedding_batch_size or tokens + item_tokens > self.embedding_batch_max_tokens
+                or byte_count + len(encoded) > self.embedding_batch_max_bytes
+                or estimated_memory + item_memory > self.embedding_memory_budget_bytes
+            )
+            if exceeds:
+                batches.append(current)
+                current, tokens, byte_count, estimated_memory = [], 0, 0, 0
+            current.append(chunk)
+            tokens += item_tokens
+            byte_count += len(encoded)
+            estimated_memory += item_memory
+        if current:
+            batches.append(current)
+        return batches
+
     def write_dense(self, prepared: PreparedDocument,
                     progress_callback: Optional[Callable[[str], None]] = None) -> None:
         child_chunks = prepared.children
         if child_chunks:
             if progress_callback:
                 progress_callback("INDEXING_DENSE")
-            self.vector_store.upsert_chunks_bulk(child_chunks, prepared.embeddings)
+            self.dense_bulkhead.run(
+                self.vector_store.upsert_chunks_bulk, child_chunks, prepared.embeddings, timeout=30
+            )
 
     def write_sparse(self, prepared: PreparedDocument,
                      progress_callback: Optional[Callable[[str], None]] = None) -> None:
         if prepared.children:
             if progress_callback:
                 progress_callback("INDEXING_SPARSE")
-            self.sparse_store.add_documents(prepared.children)
+            self.sparse_bulkhead.run(self.sparse_store.add_documents, prepared.children, timeout=30)
 
     def write_graph(self, prepared: PreparedDocument,
                     progress_callback: Optional[Callable[[str], None]] = None) -> None:
         if prepared.triples:
             if progress_callback:
                 progress_callback("INDEXING_GRAPH")
-            self.graph_store.add_triples_bulk(prepared.triples)
+            self.graph_index_bulkhead.run(self.graph_store.add_triples_bulk, prepared.triples, timeout=30)

@@ -125,6 +125,20 @@ class TelemetryMetrics:
                                       common + ["outcome", "strategy"], registry=self.registry)
         self.query_errors = Counter("rag_query_errors_total", "Query errors by bounded category.",
                                     common + ["error_type"], registry=self.registry)
+        self.admission_rejections = Counter("rag_admission_rejections_total", "Fail-fast admission rejections.",
+                                            common + ["reason"], registry=self.registry)
+        self.circuit_transitions = Counter("rag_circuit_transitions_total", "Circuit state transitions.",
+                                           common + ["dependency", "state"], registry=self.registry)
+        self.circuit_state = Gauge("rag_circuit_state", "Current circuit state as one-hot gauge.",
+                                   common + ["dependency", "state"], registry=self.registry)
+        self.pool_exhaustions = Counter("rag_connection_pool_exhaustions_total", "Connection pool exhaustion.",
+                                        common + ["pool"], registry=self.registry)
+        self.pool_checked_out = Gauge("rag_connection_pool_checked_out", "Checked-out connections.",
+                                      common + ["pool"], registry=self.registry)
+        self.pool_wait = Histogram("rag_connection_pool_wait_seconds", "Connection pool wait latency.",
+                                   common + ["pool"], buckets=LATENCY_BUCKETS, registry=self.registry)
+        self.adaptive_decisions = Counter("rag_adaptive_route_decisions_total", "Adaptive route decisions.",
+                                          common + ["decision", "reason", "mode"], registry=self.registry)
         self.query_duration = Histogram("rag_query_duration_seconds", "End-to-end query latency.", common,
                                         buckets=LATENCY_BUCKETS, registry=self.registry)
         self.retrieval_duration = Histogram("rag_retrieval_duration_seconds", "Retriever latency.",
@@ -183,6 +197,8 @@ class TelemetryMetrics:
         self.active_workers = Gauge("rag_active_workers", "Active worker processes.", common, registry=self.registry)
         self.active_ingestions = Gauge("rag_active_ingestions", "Active ingestion operations.", common,
                                        registry=self.registry)
+        self.active_queries = Gauge("rag_active_queries", "Active admitted query operations.", common,
+                                    registry=self.registry)
         self.tombstoned_documents = Gauge("rag_tombstoned_documents", "Current control-plane tombstones.", common,
                                           registry=self.registry)
         self.retired_cleanup = Gauge("rag_retired_versions_awaiting_cleanup",
@@ -213,10 +229,11 @@ class TelemetryMetrics:
             "stage": SAFE_STAGES,
             "error_type": SAFE_ERROR_TYPES,
             "outcome": SAFE_OUTCOMES,
-            "reason": SAFE_DISCARD_REASONS,
+            "reason": SAFE_DISCARD_REASONS | {"query_capacity", "executor_capacity", "entity_query",
+                                               "default_fast_path", "low_confidence", "complex_query", "deadline"},
             "strategy": {"hybrid", "dense", "sparse", "graph"},
-            "cache": {"embedding", "query", "retrieval"},
-            "result": {"hit", "miss"},
+            "cache": {"embedding", "query", "retrieval", "representation", "graph"},
+            "result": {"hit", "miss", "write", "error", "bypass"},
             "direction": {"input", "output"},
             "index": {"dense", "sparse", "graph"},
             "status": {"accepted", "queued", "parsing", "chunking", "embedding", "ready",
@@ -224,6 +241,11 @@ class TelemetryMetrics:
                        "failed_permanent", "delete_pending", "deleted"},
             "type": {"missing", "orphaned", "checksum", "count", "abandoned_staging", "retired_cleanup",
                      "tombstoned_entries", "premature_cleanup"},
+            "dependency": {"groq", "qdrant"},
+            "state": {"closed", "open", "half_open"},
+            "pool": {"postgres", "redis", "qdrant", "groq"},
+            "decision": {"fast", "graph", "hyde", "full"},
+            "mode": {"off", "adaptive", "shadow"},
         }
         bounded: Dict[str, str] = {}
         for key, value in labels.items():

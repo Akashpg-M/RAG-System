@@ -1,0 +1,672 @@
+{
+  "generated_at_utc": "2026-07-28T23:31:49Z",
+  "methodology": "Deterministic micro-experiments; one primary variable per pair; no external providers.",
+  "records": [
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.015625,
+      "error_rate": 0.0,
+      "experiment": "retrieval_execution",
+      "latency_seconds": {
+        "mean": 0.019389389999954196,
+        "p50": 0.019366099999388098,
+        "p95": 0.02003489999970043,
+        "p99": 0.020055199999660545
+      },
+      "measurement_seconds": 0.5817654000002221,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 4096,
+      "sample_count": 30,
+      "throughput_per_second": 51.56717810991947,
+      "variant": "sequential",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.03125,
+      "error_rate": 0.0,
+      "experiment": "retrieval_execution",
+      "latency_seconds": {
+        "mean": 0.007332453333431962,
+        "p50": 0.007174899999881745,
+        "p95": 0.007559800000308314,
+        "p99": 0.010419399999591406
+      },
+      "measurement_seconds": 0.22001120000004448,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 147456,
+      "sample_count": 30,
+      "throughput_per_second": 136.35669456824897,
+      "variant": "parallel",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "query_cache",
+      "latency_seconds": {
+        "mean": 0.0021542333334158077,
+        "p50": 0.0021004999998694984,
+        "p95": 0.0025415999998585903,
+        "p99": 0.002541900000323949
+      },
+      "measurement_seconds": 0.06464990000040416,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 464.0378407362185,
+      "variant": "cold",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "query_cache",
+      "latency_seconds": {
+        "mean": 2.099999013201644e-07,
+        "p50": 1.9999970390927047e-07,
+        "p95": 6.000000212225132e-07,
+        "p99": 7.999997251317836e-07
+      },
+      "measurement_seconds": 9.899999895424116e-06,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 3030303.0623127897,
+      "variant": "warm",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "retrieval_strategy",
+      "latency_seconds": {
+        "mean": 0.0022656599999512157,
+        "p50": 0.0022294999998848652,
+        "p95": 0.0025354999997944105,
+        "p99": 0.0025442999994993443
+      },
+      "measurement_seconds": 0.06800019999991491,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 441.1751730147491,
+      "variant": "dense",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "retrieval_strategy",
+      "latency_seconds": {
+        "mean": 0.004284860000037346,
+        "p50": 0.004300300000068091,
+        "p95": 0.004511299999649054,
+        "p99": 0.004527200000666198
+      },
+      "measurement_seconds": 0.12867039999946428,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 233.15385667663196,
+      "variant": "dense_sparse",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "retrieval_strategy",
+      "latency_seconds": {
+        "mean": 0.008360803333289368,
+        "p50": 0.008381700000427372,
+        "p95": 0.00856720000047062,
+        "p99": 0.008595999999670312
+      },
+      "measurement_seconds": 0.25093830000059825,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 119.55130006032749,
+      "variant": "full_hybrid",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "reranker_toggle",
+      "latency_seconds": {
+        "mean": 2.1333335098461248e-07,
+        "p50": 1.9999970390927047e-07,
+        "p95": 5.000001692678779e-07,
+        "p99": 5.000001692678779e-07
+      },
+      "measurement_seconds": 1.4800000826653559e-05,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 2027026.9138074992,
+      "variant": "disabled",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "reranker_toggle",
+      "latency_seconds": {
+        "mean": 0.003616480000012719,
+        "p50": 0.003606199999921955,
+        "p95": 0.004213199999867356,
+        "p99": 0.004285699999854842
+      },
+      "measurement_seconds": 0.10852040000008856,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 4096,
+      "sample_count": 30,
+      "throughput_per_second": 276.4457189613706,
+      "variant": "enabled",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "embedding_delivery",
+      "latency_seconds": {
+        "mean": 0.06576432000004691,
+        "p50": 0.06573610000032204,
+        "p95": 0.06691610000052606,
+        "p99": 0.06742949999988923
+      },
+      "measurement_seconds": 1.9729820000002292,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 15.205409882095486,
+      "variant": "individual",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "embedding_delivery",
+      "latency_seconds": {
+        "mean": 0.0031243900000238983,
+        "p50": 0.0031011999999464024,
+        "p95": 0.0032713000000512693,
+        "p99": 0.0035100000004604226
+      },
+      "measurement_seconds": 0.0937685999997484,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 319.9365245943791,
+      "variant": "batched",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.03125,
+      "error_rate": 0.0,
+      "experiment": "embedding_batch_size",
+      "latency_seconds": {
+        "mean": 0.00824901666661996,
+        "p50": 0.008216900000661553,
+        "p95": 0.008687100000315695,
+        "p99": 0.009056800000507792
+      },
+      "measurement_seconds": 0.2475293999996211,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 121.19772439171236,
+      "variant": "8",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "embedding_batch_size",
+      "latency_seconds": {
+        "mean": 0.0042055666667389835,
+        "p50": 0.004170799999883457,
+        "p95": 0.004746200000226963,
+        "p99": 0.0048816000007718685
+      },
+      "measurement_seconds": 0.12620120000065072,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 237.71564771052348,
+      "variant": "16",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "embedding_batch_size",
+      "latency_seconds": {
+        "mean": 0.0030956166666631663,
+        "p50": 0.0031149999995250255,
+        "p95": 0.003196600000592298,
+        "p99": 0.0032554999997955747
+      },
+      "measurement_seconds": 0.09290299999975105,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 322.9174515363378,
+      "variant": "32",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "embedding_batch_size",
+      "latency_seconds": {
+        "mean": 0.0020989600000575594,
+        "p50": 0.00208680000014283,
+        "p95": 0.0022140000000945292,
+        "p99": 0.0022360000002663583
+      },
+      "measurement_seconds": 0.06300780000037776,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 476.1315265700459,
+      "variant": "64",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "reranker_candidate_cap",
+      "latency_seconds": {
+        "mean": 0.0012684200000270115,
+        "p50": 0.0010675000003175228,
+        "p95": 0.0015626999993401114,
+        "p99": 0.001617600000827224
+      },
+      "measurement_seconds": 0.03806669999994483,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 788.0903782057146,
+      "variant": "10",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "reranker_candidate_cap",
+      "latency_seconds": {
+        "mean": 0.0017389499998898827,
+        "p50": 0.0015792000003784779,
+        "p95": 0.002554499999860127,
+        "p99": 0.002671399999599089
+      },
+      "measurement_seconds": 0.052184199999828706,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 4096,
+      "sample_count": 30,
+      "throughput_per_second": 574.8866515170967,
+      "variant": "20",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "reranker_candidate_cap",
+      "latency_seconds": {
+        "mean": 0.0029026066667029228,
+        "p50": 0.0030237999999371823,
+        "p95": 0.0036417000001165434,
+        "p99": 0.003819900000053167
+      },
+      "measurement_seconds": 0.08709640000051877,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 344.4459242841416,
+      "variant": "30",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.015625,
+      "error_rate": 0.0,
+      "experiment": "reranker_candidate_cap",
+      "latency_seconds": {
+        "mean": 0.005925400000038886,
+        "p50": 0.006064199999855191,
+        "p95": 0.006754400000318128,
+        "p99": 0.006772999999157037
+      },
+      "measurement_seconds": 0.17778259999977308,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 4096,
+      "sample_count": 30,
+      "throughput_per_second": 168.74542278062248,
+      "variant": "50",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.09375,
+      "error_rate": 0.0,
+      "experiment": "query_concurrency",
+      "latency_seconds": {
+        "mean": 0.04890477333331849,
+        "p50": 0.04907920000005106,
+        "p95": 0.05029130000002624,
+        "p99": 0.05039729999953124
+      },
+      "measurement_seconds": 1.4671812999995382,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 28672,
+      "sample_count": 30,
+      "throughput_per_second": 20.447370750983158,
+      "variant": "1",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.109375,
+      "error_rate": 0.0,
+      "experiment": "query_concurrency",
+      "latency_seconds": {
+        "mean": 0.013289696666652162,
+        "p50": 0.0131400999998732,
+        "p95": 0.014137600000140083,
+        "p99": 0.01599960000021383
+      },
+      "measurement_seconds": 0.39873760000045877,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 32768,
+      "sample_count": 30,
+      "throughput_per_second": 75.23744939018914,
+      "variant": "4",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0625,
+      "error_rate": 0.0,
+      "experiment": "query_concurrency",
+      "latency_seconds": {
+        "mean": 0.007863116666703718,
+        "p50": 0.0077952000001459965,
+        "p95": 0.00823110000055749,
+        "p99": 0.008350000000064028
+      },
+      "measurement_seconds": 0.23592600000029051,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 4096,
+      "sample_count": 30,
+      "throughput_per_second": 127.15851580564693,
+      "variant": "8",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.09375,
+      "error_rate": 0.0,
+      "experiment": "ingestion_worker_concurrency",
+      "latency_seconds": {
+        "mean": 0.031356273333434125,
+        "p50": 0.02745009999944159,
+        "p95": 0.047877700000753975,
+        "p99": 0.08035060000020167
+      },
+      "measurement_seconds": 0.9407387999999628,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": -675840,
+      "sample_count": 30,
+      "throughput_per_second": 31.889829567996117,
+      "variant": "1",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.109375,
+      "error_rate": 0.0,
+      "experiment": "ingestion_worker_concurrency",
+      "latency_seconds": {
+        "mean": 0.018517050000082236,
+        "p50": 0.015129399999750603,
+        "p95": 0.033059700000194425,
+        "p99": 0.04365449999932025
+      },
+      "measurement_seconds": 0.5555708000001687,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 53.99851828064198,
+      "variant": "2",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.125,
+      "error_rate": 0.0,
+      "experiment": "ingestion_worker_concurrency",
+      "latency_seconds": {
+        "mean": 0.008407593333261805,
+        "p50": 0.008314199999404082,
+        "p95": 0.010376799999903596,
+        "p99": 0.010508200000003853
+      },
+      "measurement_seconds": 0.2522754999999961,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 118.91761189651973,
+      "variant": "4",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.109375,
+      "error_rate": 0.0,
+      "experiment": "adaptive_routing",
+      "latency_seconds": {
+        "mean": 0.008378866666741184,
+        "p50": 0.00799879999976838,
+        "p95": 0.01070999999956257,
+        "p99": 0.013202199999795994
+      },
+      "measurement_seconds": 0.2514209999999366,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 119.32177503075545,
+      "variant": "full_hybrid",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.09375,
+      "error_rate": 0.0,
+      "experiment": "adaptive_routing",
+      "latency_seconds": {
+        "mean": 0.007629586666735122,
+        "p50": 0.007592099999783386,
+        "p95": 0.008066100000178267,
+        "p99": 0.008105900000373367
+      },
+      "measurement_seconds": 0.22893910000038886,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 131.03921523212523,
+      "variant": "shadow",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "publication_snapshot",
+      "latency_seconds": {
+        "mean": 0.001129293333391009,
+        "p50": 0.001087300000108371,
+        "p95": 0.0012915999996039318,
+        "p99": 0.0015583999993395992
+      },
+      "measurement_seconds": 0.033960999999180785,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 883.3662142081702,
+      "variant": "database_10",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "publication_snapshot",
+      "latency_seconds": {
+        "mean": 0.0005998433333237093,
+        "p50": 0.0005450000007840572,
+        "p95": 0.0007898000003478955,
+        "p99": 0.0013548999995691702
+      },
+      "measurement_seconds": 0.018028099999355618,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 1664.068870323123,
+      "variant": "cached_10",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.03125,
+      "error_rate": 0.0,
+      "experiment": "publication_snapshot",
+      "latency_seconds": {
+        "mean": 0.0014858333333601574,
+        "p50": 0.0014096000004428788,
+        "p95": 0.002232299999377574,
+        "p99": 0.002627300000312971
+      },
+      "measurement_seconds": 0.04461199999968812,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 40960,
+      "sample_count": 30,
+      "throughput_per_second": 672.4648076797661,
+      "variant": "database_1000",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "publication_snapshot",
+      "latency_seconds": {
+        "mean": 0.0005552599999039861,
+        "p50": 0.0005324000003383844,
+        "p95": 0.0006605999997191248,
+        "p99": 0.0010317999995095306
+      },
+      "measurement_seconds": 0.016684100000020408,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 1798.1191673487515,
+      "variant": "cached_1000",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.109375,
+      "error_rate": 0.0,
+      "experiment": "publication_snapshot",
+      "latency_seconds": {
+        "mean": 0.006182906666708732,
+        "p50": 0.006078200000047218,
+        "p95": 0.008290499999930034,
+        "p99": 0.009016300000439514
+      },
+      "measurement_seconds": 0.18555800000012823,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 917504,
+      "sample_count": 30,
+      "throughput_per_second": 161.67451686254037,
+      "variant": "database_10000",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "publication_snapshot",
+      "latency_seconds": {
+        "mean": 0.0005512000000029123,
+        "p50": 0.0005439999995360267,
+        "p95": 0.0005941999997958192,
+        "p99": 0.0006993000006332295
+      },
+      "measurement_seconds": 0.016571500000281958,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 1810.3370243785753,
+      "variant": "cached_10000",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "candidate_filtering",
+      "latency_seconds": {
+        "mean": 8.133332509411654e-07,
+        "p50": 5.000001692678779e-07,
+        "p95": 3.099999958067201e-06,
+        "p99": 6.399999620043673e-06
+      },
+      "measurement_seconds": 3.330000072310213e-05,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 900900.8813380377,
+      "variant": "without_refill",
+      "warmup_seconds": 0
+    },
+    {
+      "cache_state": "not_applicable",
+      "cpu_seconds": 0.0,
+      "error_rate": 0.0,
+      "experiment": "candidate_filtering",
+      "latency_seconds": {
+        "mean": 1.1233333073808657e-06,
+        "p50": 1.0000003385357559e-06,
+        "p95": 2.1999994714860804e-06,
+        "p99": 3.000000106112566e-06
+      },
+      "measurement_seconds": 3.899999956047395e-05,
+      "provider": "deterministic_stub",
+      "rss_delta_bytes": 0,
+      "sample_count": 30,
+      "throughput_per_second": 769230.7778999221,
+      "variant": "bounded_refill",
+      "warmup_seconds": 0
+    }
+  ],
+  "schema_version": "1.0"
+}

@@ -1,10 +1,13 @@
 import logging
 import hashlib
+import httpx
 from typing import List, Dict, Any
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, PointIdsList
 from src.config import Config
 from src.models import ChildChunk
+from src.core.performance import CircuitBreaker
+from src.observability import get_observability
 
 logger = logging.getLogger("VectorStore")
 
@@ -14,10 +17,36 @@ def qdrant_point_id(chunk_id: str) -> int:
     return int(digest[:15], 16)
 
 class ProductionVectorStore:
-    def __init__(self, collection_name: str, vector_dim: int, storage_path: str = None, url: str = None):
+    def __init__(self, collection_name: str, vector_dim: int, storage_path: str = None, url: str = None,
+                 pool_size: int = 16, breaker_failure_threshold: int = 3,
+                 breaker_recovery_seconds: float = 15, breaker_half_open_probes: int = 1):
         self.collection_name = collection_name
-        self.client = QdrantClient(url=url) if url else QdrantClient(path=storage_path or Config.QDRANT_STORAGE_PATH)
+        self.client = QdrantClient(
+            url=url, limits=httpx.Limits(max_connections=pool_size, max_keepalive_connections=pool_size)
+        ) if url else QdrantClient(
+            path=storage_path or Config.QDRANT_STORAGE_PATH
+        )
+        self.breaker = CircuitBreaker("qdrant", breaker_failure_threshold, breaker_recovery_seconds,
+                                      breaker_half_open_probes)
         self._ensure_collection(vector_dim)
+
+    @staticmethod
+    def _transient(error: BaseException) -> bool:
+        return isinstance(error, (ConnectionError, TimeoutError, OSError)) or int(
+            getattr(error, "status_code", 0) or 0
+        ) >= 500
+
+    def _call(self, operation, *args, **kwargs):
+        before = self.breaker.state.value
+        try:
+            return self.breaker.call(operation, *args, transient=self._transient, **kwargs)
+        finally:
+            metrics = get_observability().metrics
+            after = self.breaker.state.value
+            for state in ("closed", "open", "half_open"):
+                metrics.labels(metrics.circuit_state, dependency="qdrant", state=state).set(int(after == state))
+            if after != before:
+                metrics.labels(metrics.circuit_transitions, dependency="qdrant", state=after).inc()
 
     def _ensure_collection(self, vector_dim: int):
         # if not self.client.collection_exists(self.collection_name):
@@ -57,7 +86,8 @@ class ProductionVectorStore:
         target_ids = list(id_map.keys())
         
         # Single batched roundtrip call
-        existing_records = self.client.retrieve(
+        existing_records = self._call(
+            self.client.retrieve,
             collection_name=self.collection_name,
             ids=target_ids,
             with_payload=True
@@ -97,7 +127,7 @@ class ProductionVectorStore:
         # Segment arrays into physical sub-batches
         for i in range(0, len(points), batch_size):
             batch = points[i:i + batch_size]
-            self.client.upsert(collection_name=self.collection_name, wait=True, points=batch)
+            self._call(self.client.upsert, collection_name=self.collection_name, wait=True, points=batch)
             
         logger.info(f"Bulk-uploaded {len(points)} vector nodes via batch sized windows.")
 
@@ -107,7 +137,8 @@ class ProductionVectorStore:
             conditions = [FieldCondition(key=k, match=MatchValue(value=v)) for k, v in metadata_filter.items()]
             qdrant_filter = Filter(must=conditions)
 
-        results = self.client.search(
+        results = self._call(
+            self.client.search,
             collection_name=self.collection_name,
             query_vector=query_vector,
             query_filter=qdrant_filter,
@@ -123,7 +154,8 @@ class ProductionVectorStore:
         return formatted_hits
     
     def delete_vector(self, chunk_id: str):
-        self.client.delete(
+        self._call(
+            self.client.delete,
             collection_name=self.collection_name,
             points_selector=PointIdsList(points=[qdrant_point_id(chunk_id)]),
             wait=True,
@@ -134,7 +166,8 @@ class ProductionVectorStore:
         point_ids = []
         offset = None
         while True:
-            records, offset = self.client.scroll(
+            records, offset = self._call(
+                self.client.scroll,
                 collection_name=self.collection_name,
                 scroll_filter=query_filter,
                 limit=256,
@@ -146,7 +179,8 @@ class ProductionVectorStore:
             if offset is None:
                 break
         if point_ids:
-            self.client.delete(
+            self._call(
+                self.client.delete,
                 collection_name=self.collection_name,
                 points_selector=PointIdsList(points=point_ids),
                 wait=True,
@@ -157,7 +191,7 @@ class ProductionVectorStore:
             FieldCondition(key="document_id", match=MatchValue(value=document_id)),
             FieldCondition(key="version_id", match=MatchValue(value=version_id)),
         ])
-        self.client.delete(collection_name=self.collection_name, points_selector=query_filter, wait=True)
+        self._call(self.client.delete, collection_name=self.collection_name, points_selector=query_filter, wait=True)
 
     def version_chunks(self, document_id: str, version_id: str) -> Dict[str, str]:
         query_filter = Filter(must=[
@@ -167,7 +201,8 @@ class ProductionVectorStore:
         chunks = {}
         offset = None
         while True:
-            records, offset = self.client.scroll(
+            records, offset = self._call(
+                self.client.scroll,
                 collection_name=self.collection_name, scroll_filter=query_filter, limit=256, offset=offset,
                 with_payload=True, with_vectors=False,
             )
@@ -179,5 +214,10 @@ class ProductionVectorStore:
                 return chunks
 
     def is_ready(self) -> bool:
-        self.client.get_collections()
+        self._call(self.client.get_collections)
         return True
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if close:
+            close()

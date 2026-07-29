@@ -200,6 +200,12 @@ class SQLitePublicationRepository:
             ).fetchall())
         return PublicationSnapshot(revision, active, tombstones, degraded)
 
+    def current_revision(self) -> int:
+        with sqlite3.connect(self.db_path) as connection:
+            return int(connection.execute(
+                "SELECT revision FROM publication_state WHERE singleton=1"
+            ).fetchone()[0])
+
     def tombstone(self, document_id: str) -> tuple[int, bool]:
         with sqlite3.connect(self.db_path, timeout=30) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -265,6 +271,39 @@ class SQLitePublicationRepository:
                 "SELECT job_id,document_id,version_id,job_type FROM cleanup_jobs WHERE status IN ('PENDING','FAILED')"
             ).fetchall()
 
+    def claim_cleanup(self, job_id: str) -> bool:
+        """Atomically fence rollback/activation from a physical cleanup in progress."""
+        with sqlite3.connect(self.db_path, timeout=30) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute(
+                "SELECT document_id,version_id,job_type,status FROM cleanup_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if not job or job[3] not in ("PENDING", "FAILED"):
+                connection.rollback()
+                return False
+            if job[2] == "RETIRE_VERSION":
+                active = connection.execute(
+                    "SELECT 1 FROM active_versions WHERE document_id=? AND version_id=?", (job[0], job[1])
+                ).fetchone()
+                status = connection.execute(
+                    "SELECT status FROM version_publications WHERE document_id=? AND version_id=?", (job[0], job[1])
+                ).fetchone()
+                if active or not status or status[0] != "RETIRED":
+                    connection.rollback()
+                    return False
+                connection.execute(
+                    "UPDATE version_publications SET status='CLEANING' WHERE document_id=? AND version_id=?",
+                    (job[0], job[1]),
+                )
+            elif not connection.execute(
+                "SELECT 1 FROM deletion_tombstones WHERE document_id=?", (job[0],)
+            ).fetchone():
+                connection.rollback()
+                return False
+            connection.execute("UPDATE cleanup_jobs SET status='RUNNING',updated_at=? WHERE job_id=?", (time.time(), job_id))
+            connection.commit()
+            return True
+
     def abandoned_staging(self, age_seconds: float) -> list[tuple[str, str]]:
         with sqlite3.connect(self.db_path) as connection:
             return connection.execute(
@@ -288,6 +327,9 @@ class SQLitePublicationRepository:
             )
             if success and job and job[2] == "RETIRE_VERSION" and job[1]:
                 connection.execute("UPDATE version_publications SET status='REMOVED' WHERE document_id=? AND version_id=?",
+                                   (job[0], job[1]))
+            elif not success and job and job[2] == "RETIRE_VERSION" and job[1]:
+                connection.execute("UPDATE version_publications SET status='RETIRED' WHERE document_id=? AND version_id=?",
                                    (job[0], job[1]))
             connection.commit()
 

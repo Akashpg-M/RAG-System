@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Iterator
 from groq import Groq
 from src.config import Config
 from src.observability import get_observability
+from src.core.performance import CircuitBreaker
 
 logger = logging.getLogger("StreamingGenerator")
 
@@ -14,11 +15,13 @@ class ProductionResponseGenerator:
     Injects retrieved multi-modal evidence contexts into XML blocks 
     and handles token streaming via Groq.
     """
-    def __init__(self, llm_client=None, model_name: str = None, api_key: str = None):
+    def __init__(self, llm_client=None, model_name: str = None, api_key: str = None,
+                 circuit_breaker: CircuitBreaker | None = None):
         # Establish the runtime link to the ultra-fast execution backend
         resolved_key = Config.GROQ_API_KEY if api_key is None else api_key
         self.llm_client = llm_client or (Groq(api_key=resolved_key) if resolved_key else None)
         self.model_name = model_name or Config.GROQ_MODEL_NAME
+        self.circuit_breaker = circuit_breaker
 
     def _build_xml_context_prompt(self, query: str, context_pool: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         """Constructs a deterministic system and user prompt utilizing strict XML encapsulation."""
@@ -90,12 +93,12 @@ class ProductionResponseGenerator:
             started = time.perf_counter()
             first_token = True
             with telemetry.span("query.generation.provider", {"gen_ai.system": "groq"}):
-                stream = self.llm_client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    temperature=0.1,
-                    stream=True
-                )
+                def operation():
+                    return self.llm_client.chat.completions.create(
+                        model=self.model_name, messages=messages, temperature=0.1, stream=True
+                    )
+
+                stream = self.circuit_breaker.call(operation) if self.circuit_breaker else operation()
                 for chunk in stream:
                     token = chunk.choices[0].delta.content
                     if token:

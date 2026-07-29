@@ -1,19 +1,38 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional, Tuple
 
-from psycopg import connect
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
 
 from src.core.contracts import DocumentVersion, IndexingStatus, IngestionTask
 from src.core.publication import (
     IndexStageResult, ManifestEntry, PublicationSnapshot, PublicationValidationError, StaleFencingToken,
     manifest_checksum,
 )
+from src.observability import get_observability
+
+
+_pools: dict[str, ConnectionPool] = {}
+_pools_lock = threading.Lock()
+
+
+def shared_pool(database_url: str, minimum: int = 1, maximum: int = 12) -> ConnectionPool:
+    normalized = database_url.replace("postgresql+psycopg://", "postgresql://", 1)
+    with _pools_lock:
+        pool = _pools.get(normalized)
+        if pool is None:
+            pool = ConnectionPool(normalized, min_size=minimum, max_size=maximum,
+                                  kwargs={"row_factory": dict_row}, timeout=5, open=True)
+            _pools[normalized] = pool
+        return pool
 
 
 class PostgresGraphIndex:
@@ -82,12 +101,37 @@ class PostgresGraphIndex:
 
 class PostgresControlPlane:
     """Shared adapter for existing repository ports and Stage 4 publication transactions."""
-    def __init__(self, database_url: str, retention_versions: int = 2):
+    def __init__(self, database_url: str, retention_versions: int = 2,
+                 pool_min: int = 1, pool_max: int = 12):
         self.database_url = database_url.replace("postgresql+psycopg://", "postgresql://", 1)
         self.retention_versions = retention_versions
+        self.pool = shared_pool(self.database_url, pool_min, pool_max)
 
     def _connection(self):
-        return connect(self.database_url, row_factory=dict_row)
+        @contextmanager
+        def acquire():
+            started = time.perf_counter()
+            metrics = get_observability().metrics
+            try:
+                with self.pool.connection() as connection:
+                    metrics.labels(metrics.pool_wait, pool="postgres").observe(time.perf_counter() - started)
+                    stats = self.pool.get_stats()
+                    checked_out = max(0, int(stats.get("pool_size", 0)) - int(stats.get("pool_available", 0)))
+                    metrics.labels(metrics.pool_checked_out, pool="postgres").set(checked_out)
+                    yield connection
+            except Exception as error:
+                if error.__class__.__name__ == "PoolTimeout":
+                    metrics.labels(metrics.pool_exhaustions, pool="postgres").inc()
+                raise
+            finally:
+                stats = self.pool.get_stats()
+                checked_out = max(0, int(stats.get("pool_size", 0)) - int(stats.get("pool_available", 0)))
+                metrics.labels(metrics.pool_checked_out, pool="postgres").set(checked_out)
+
+        return acquire()
+
+    def pool_stats(self) -> dict[str, int]:
+        return {key: int(value) for key, value in self.pool.get_stats().items()}
 
     def is_ready(self) -> bool:
         with self._connection() as connection:
@@ -413,6 +457,10 @@ class PostgresControlPlane:
             ).fetchall())
         return PublicationSnapshot(revision, active, tombstones, degraded)
 
+    def current_revision(self) -> int:
+        with self._connection() as connection:
+            return int(connection.execute("SELECT revision FROM corpus_publication").fetchone()["revision"])
+
     def tombstone(self, document_id: str) -> tuple[int, bool]:
         with self._connection() as connection:
             connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (document_id,))
@@ -468,6 +516,37 @@ class PostgresControlPlane:
                                       "WHERE status IN ('PENDING','FAILED')").fetchall()
         return [(row["job_id"], row["document_id"], row["version_id"], row["job_type"]) for row in rows]
 
+    def claim_cleanup(self, job_id: str) -> bool:
+        """Claim only conclusively stale content and make cleanup mutually exclusive with rollback."""
+        with self._connection() as connection:
+            job = connection.execute(
+                "SELECT * FROM cleanup_jobs WHERE job_id=%s FOR UPDATE", (job_id,)
+            ).fetchone()
+            if not job or job["status"] not in ("PENDING", "FAILED"):
+                return False
+            connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (job["document_id"],))
+            if job["job_type"] == "RETIRE_VERSION":
+                active = connection.execute(
+                    "SELECT 1 FROM active_versions WHERE document_id=%s AND version_id=%s",
+                    (job["document_id"], job["version_id"]),
+                ).fetchone()
+                version = connection.execute(
+                    "SELECT status FROM version_publications WHERE document_id=%s AND version_id=%s FOR UPDATE",
+                    (job["document_id"], job["version_id"]),
+                ).fetchone()
+                if active or not version or version["status"] != "RETIRED":
+                    return False
+                connection.execute(
+                    "UPDATE version_publications SET status='CLEANING' WHERE document_id=%s AND version_id=%s",
+                    (job["document_id"], job["version_id"]),
+                )
+            elif not connection.execute(
+                "SELECT 1 FROM deletion_tombstones WHERE document_id=%s", (job["document_id"],)
+            ).fetchone():
+                return False
+            connection.execute("UPDATE cleanup_jobs SET status='RUNNING',updated_at=now() WHERE job_id=%s", (job_id,))
+            return True
+
     def abandoned_staging(self, age_seconds: float) -> list[tuple[str, str]]:
         with self._connection() as connection:
             rows = connection.execute(
@@ -489,6 +568,9 @@ class PostgresControlPlane:
                                "WHERE job_id=%s", ("COMPLETE" if success else "FAILED", error_code, job_id))
             if success and job and job["job_type"] == "RETIRE_VERSION" and job["version_id"]:
                 connection.execute("UPDATE version_publications SET status='REMOVED' WHERE document_id=%s AND version_id=%s",
+                                   (job["document_id"], job["version_id"]))
+            elif not success and job and job["job_type"] == "RETIRE_VERSION" and job["version_id"]:
+                connection.execute("UPDATE version_publications SET status='RETIRED' WHERE document_id=%s AND version_id=%s",
                                    (job["document_id"], job["version_id"]))
 
     def stats(self) -> dict[str, object]:

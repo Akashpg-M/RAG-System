@@ -1,0 +1,69 @@
+{
+  "benchmark": {
+    "cache_state": "warm",
+    "concurrency": 2,
+    "dataset_version": "stage6-query-set-v1",
+    "maximum_error_rate": 0.02,
+    "measurement_requests": 40,
+    "name": "local-retrieval",
+    "profile": "local",
+    "queries": [
+      "What deployment technology is described?",
+      "Which database stores control-plane records?",
+      "How are ingestion messages delivered?",
+      "What prevents stale document versions from being queried?"
+    ],
+    "query_timeout_seconds": 15,
+    "schema_version": "1.0",
+    "slo_p95_seconds": 5.0,
+    "warmup_requests": 8
+  },
+  "environment": {
+    "cache_state": "warm",
+    "captured_at": "2026-07-28T17:33:10.728974+00:00",
+    "concurrency": 2,
+    "cpu_logical": 12,
+    "cpu_physical": 6,
+    "dataset_version": "stage6-query-set-v1",
+    "docker": {
+      "cpus": 2,
+      "memory_bytes": 4111769600,
+      "operating_system": "Docker Desktop"
+    },
+    "git": {
+      "dirty": true,
+      "revision": "7d1c9991a376f695277f88a3785ff3dcc017c24f"
+    },
+    "measurement_requests": 40,
+    "memory_available_bytes": 460161024,
+    "memory_total_bytes": 7885529088,
+    "models": {
+      "embedding": "all-MiniLM-L6-v2",
+      "generation": "llama-3.3-70b-versatile",
+      "reranker": "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    },
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.12.0",
+    "warmup_requests": 8
+  },
+  "label": "stage5-local-retrieval-baseline",
+  "result": {
+    "duration_seconds": 130.9161124000093,
+    "ended_at": "2026-07-28T17:35:42.171608+00:00",
+    "error_rate": 0.0,
+    "latency_seconds": {
+      "mean": 6.442988167499425,
+      "p50": 6.178578699997161,
+      "p95": 11.14963749999879,
+      "p99": 12.375932199996896
+    },
+    "rejection_rate": 0.0,
+    "sample_count": 40,
+    "started_at": "2026-07-28T17:33:31.254814+00:00",
+    "status_counts": {
+      "200": 40
+    },
+    "throughput_qps": 0.305539167537923
+  },
+  "schema_version": "1.0"
+}

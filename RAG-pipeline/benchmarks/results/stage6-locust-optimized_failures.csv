@@ -1,0 +1,2 @@
+Method,Name,Error,Occurrences,First Seen,Last Seen
+POST,POST /api/v1/query,HTTPError('429 Client Error: Too Many Requests for url: POST /api/v1/query'),711,2026-07-28T18:14:19Z,2026-07-28T18:14:24Z

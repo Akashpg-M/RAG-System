@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 from typing import Any, Dict, List, Optional
 
 from src.core.ports import CacheProvider, DenseIndex, EmbeddingProvider, GraphIndex, SparseIndex
+from src.core.cache_keys import query_embedding_key
 from src.observability import get_observability
 
 
@@ -20,10 +20,12 @@ def candidate_matches(candidate: Dict[str, Any], filters: Optional[Dict[str, Any
 
 
 class DenseRetriever:
-    def __init__(self, vector_store: DenseIndex, embedder: EmbeddingProvider, cache: CacheProvider):
+    def __init__(self, vector_store: DenseIndex, embedder: EmbeddingProvider, cache: CacheProvider,
+                 embedding_model_version: str = "configured"):
         self.store = vector_store
         self.embedder = embedder
         self.cache = cache
+        self.embedding_model_version = embedding_model_version
 
     def retrieve(
         self,
@@ -32,12 +34,13 @@ class DenseRetriever:
         filters: Optional[Dict[str, Any]] = None,
         context: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
+        query_hash = query_embedding_key(query, self.embedding_model_version)
         query_vector = self.cache.get(query_hash)
         telemetry = get_observability().metrics
-        telemetry.labels(
-            telemetry.cache_requests, cache="query", result="hit" if query_vector is not None else "miss"
-        ).inc()
+        if not getattr(self.cache, "records_metrics", False):
+            telemetry.labels(
+                telemetry.cache_requests, cache="query", result="hit" if query_vector is not None else "miss"
+            ).inc()
         if query_vector is None:
             query_vector = self.embedder.get_embeddings_batched([query])[0]
             self.cache.set(query_hash, query_vector)

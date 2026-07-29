@@ -4,11 +4,13 @@ import logging
 from typing import Dict, Any, List
 from src.graph.prompt_builder import PromptBuilder
 from src.graph.ontology import DomainOntology
+from src.core.performance import CircuitBreaker
 
 logger = logging.getLogger("GraphExtractor")
 
 class GraphExtractor:
-    def __init__(self, llm_client: Any, model_name: str, ontology: DomainOntology):
+    def __init__(self, llm_client: Any, model_name: str, ontology: DomainOntology,
+                 circuit_breaker: CircuitBreaker | None = None):
         """
         Dependency injection container for the graph construction layer.
         """
@@ -18,6 +20,7 @@ class GraphExtractor:
         self.system_prompt = PromptBuilder.build(ontology.model_dump())        
         self.allowed_entities = set(ontology.entities) | {"DOMAIN_CONCEPT"}
         self.allowed_relations = set(ontology.relations)
+        self.circuit_breaker = circuit_breaker
 
     def extract_triples(self, text: str) -> List[Dict[str, Any]]:
         """
@@ -28,15 +31,14 @@ class GraphExtractor:
             return []
         try:
             # Polymorphic wrapper to support multiple providers (Groq/OpenAI/Ollama)
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": f"Extract triples from the following text:\n\n{text}"}
-                ],
-                temperature=0.0,  # Zero out creativity for deterministic extraction
-                response_format={"type": "json_object"}
-            )
+            def operation():
+                return self.client.chat.completions.create(
+                    model=self.model_name, messages=[{"role": "system", "content": self.system_prompt},
+                                                     {"role": "user", "content": f"Extract triples from the following text:\n\n{text}"}],
+                    temperature=0.0, response_format={"type": "json_object"}
+                )
+
+            response = self.circuit_breaker.call(operation) if self.circuit_breaker else operation()
             
             raw_content = response.choices[0].message.content
             data = json.loads(raw_content)

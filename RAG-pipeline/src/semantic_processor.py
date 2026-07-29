@@ -3,6 +3,7 @@ import logging
 from typing import Dict, Any
 from groq import Groq
 from src.config import Config
+from src.core.performance import CircuitBreaker
 
 logger = logging.getLogger("SemanticQueryProcessor")
 
@@ -11,11 +12,13 @@ class SemanticQueryProcessor:
     Decoupled Linguistic Synthesis Layer.
     Can be dynamically bypassed for local deterministic testing.
     """
-    def __init__(self, semantic_enabled: bool = True, llm_client=None, model_name: str = None, api_key: str = None):
+    def __init__(self, semantic_enabled: bool = True, llm_client=None, model_name: str = None, api_key: str = None,
+                 circuit_breaker: CircuitBreaker | None = None):
         resolved_key = Config.GROQ_API_KEY if api_key is None else api_key
         self.model_name = model_name or Config.GROQ_MODEL_NAME
         self.enabled = semantic_enabled and bool(resolved_key or llm_client)
         self.llm_client = None
+        self.circuit_breaker = circuit_breaker
         
         if self.enabled:
             logger.info("Initializing Groq Semantic Processor Pipeline Link...")
@@ -38,15 +41,14 @@ class SemanticQueryProcessor:
         2. "hyde_document": A 2-to-3 sentence hypothetical technical answer to the query.
         """
         try:
-            response = self.llm_client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": raw_query}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0
-            )
+            def operation():
+                return self.llm_client.chat.completions.create(
+                    model=self.model_name, messages=[{"role": "system", "content": sys_prompt},
+                                                     {"role": "user", "content": raw_query}],
+                    response_format={"type": "json_object"}, temperature=0.0
+                )
+
+            response = self.circuit_breaker.call(operation) if self.circuit_breaker else operation()
             data = json.loads(response.choices[0].message.content)
             return {
                 "original_query": raw_query,

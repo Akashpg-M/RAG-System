@@ -1,0 +1,12 @@
+.git
+.venv
+venv
+__pycache__
+.pytest_cache
+.ruff_cache
+.mypy_cache
+*.db
+*.sqlite*
+qdrant_local_data
+uploaded_documents
+benchmarks/results

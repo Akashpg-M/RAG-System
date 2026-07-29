@@ -28,7 +28,9 @@ class SlidingWindowRateLimiter:
             while events and events[0] <= cutoff:
                 events.popleft()
             if len(events) >= self.requests:
-                raise ApiError(429, "rate_limit_exceeded", "Request rate limit exceeded")
+                raise ApiError(429, "rate_limit_exceeded", "Request rate limit exceeded", {
+                    "Retry-After": str(min(60, max(1, int(self.window_seconds))))
+                })
             events.append(now)
 
 
@@ -49,5 +51,5 @@ class ApiSecurity:
         client_host = request.client.host if request.client else "unknown"
         raw_identity = supplied if supplied else client_host
         identity = hashlib.sha256(raw_identity.encode("utf-8")).hexdigest()
+        request.state.authorization_scope = identity
         self.rate_limiter.check(identity)
-

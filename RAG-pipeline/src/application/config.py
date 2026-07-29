@@ -25,7 +25,7 @@ class ProviderSettings(BaseModel):
     reranker: str = "cross_encoder"
     query_processor: str = "groq"
     answer_generator: str = "groq"
-    cache: str = "sqlite"
+    cache: str = "redis"
     queue: str = "redis"
     object_storage: str = "local"
     document_repository: str = "postgres"
@@ -129,6 +129,7 @@ class QueueSettings(BaseModel):
     shutdown_timeout_seconds: float = Field(default=30, gt=0)
     sqs_queue_url: str = ""
     sqs_dlq_url: str = ""
+    embedded_dispatcher: bool = True
 
     @model_validator(mode="after")
     def validate_safety(self) -> "QueueSettings":
@@ -156,10 +157,61 @@ class ObservabilitySettings(BaseModel):
     enabled: bool = True
     otlp_endpoint: str = "http://127.0.0.1:4317"
     sample_ratio: float = Field(default=1.0, ge=0, le=1)
-    service_version: str = "5.0.0"
+    service_version: str = "6.0.0"
     worker_metrics_port: int = Field(default=9465, gt=1024, lt=65536)
     dispatcher_metrics_port: int = Field(default=9466, gt=1024, lt=65536)
     queue_sample_interval_seconds: float = Field(default=5, gt=0, le=60)
+
+
+class PerformanceSettings(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    query_timeout_seconds: float = Field(default=8.0, gt=0, le=120)
+    per_retriever_timeout_seconds: float = Field(default=2.5, gt=0, le=60)
+    query_max_concurrency: int = Field(default=8, gt=0, le=128)
+    query_executor_pending: int = Field(default=8, gt=0, le=256)
+    retriever_workers: int = Field(default=16, gt=0, le=128)
+    retriever_pending: int = Field(default=32, gt=0, le=512)
+    embedding_concurrency: int = Field(default=1, gt=0, le=16)
+    rewrite_concurrency: int = Field(default=2, gt=0, le=32)
+    graph_concurrency: int = Field(default=2, gt=0, le=32)
+    reranker_concurrency: int = Field(default=1, gt=0, le=16)
+    generation_concurrency: int = Field(default=2, gt=0, le=32)
+    parsing_concurrency: int = Field(default=2, gt=0, le=16)
+    index_concurrency: int = Field(default=2, gt=0, le=16)
+    reranker_candidate_cap: int = Field(default=30, gt=0, le=500)
+    reranker_batch_size: int = Field(default=8, gt=0, le=128)
+    reranker_skip_below: int = Field(default=2, ge=0, le=100)
+    refill_max_rounds: int = Field(default=2, ge=0, le=5)
+    refill_candidate_cap: int = Field(default=100, gt=0, le=1000)
+    snapshot_cache_entries: int = Field(default=8, gt=0, le=100)
+    snapshot_cache_ttl_seconds: float = Field(default=300, gt=0)
+    cache_ttl_seconds: int = Field(default=3600, gt=0)
+    cache_max_value_bytes: int = Field(default=1_000_000, gt=1024)
+    cache_lock_seconds: int = Field(default=10, gt=0, le=120)
+    postgres_pool_min: int = Field(default=1, ge=0, le=20)
+    postgres_pool_max: int = Field(default=12, gt=0, le=100)
+    qdrant_pool_size: int = Field(default=16, gt=0, le=100)
+    breaker_failure_threshold: int = Field(default=3, gt=0, le=100)
+    breaker_recovery_seconds: float = Field(default=15, gt=0)
+    breaker_half_open_probes: int = Field(default=1, gt=0, le=10)
+    embedding_batch_max_tokens: int = Field(default=8192, gt=0)
+    embedding_batch_max_bytes: int = Field(default=1_000_000, gt=0)
+    embedding_memory_budget_bytes: int = Field(default=64_000_000, gt=0)
+    adaptive_retrieval_mode: str = "off"
+
+    @model_validator(mode="after")
+    def validate_performance(self) -> "PerformanceSettings":
+        if self.query_executor_pending < self.query_max_concurrency:
+            raise ValueError("query pending capacity must cover active concurrency")
+        if self.retriever_pending < self.retriever_workers:
+            raise ValueError("retriever pending capacity must cover worker count")
+        if self.per_retriever_timeout_seconds > self.query_timeout_seconds:
+            raise ValueError("retriever timeout must not exceed query deadline")
+        if self.postgres_pool_min > self.postgres_pool_max:
+            raise ValueError("PostgreSQL pool minimum must not exceed maximum")
+        if self.adaptive_retrieval_mode not in ("off", "adaptive", "shadow"):
+            raise ValueError("adaptive retrieval mode must be off, adaptive or shadow")
+        return self
 
 
 class AppConfig(BaseModel):
@@ -173,6 +225,7 @@ class AppConfig(BaseModel):
     queue: QueueSettings = Field(default_factory=QueueSettings)
     publication: PublicationSettings = Field(default_factory=PublicationSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+    performance: PerformanceSettings = Field(default_factory=PerformanceSettings)
 
 
 def profile_config(profile: Profile | str, root: Optional[Path] = None) -> AppConfig:
@@ -247,6 +300,17 @@ def load_config(profile: Profile | str = Profile.LOCAL, environ: Optional[Mappin
             "graph_index_required": values.get(
                 "GRAPH_INDEX_REQUIRED", str(base.pipeline.graph_index_required)
             ).lower() in ("1", "true", "yes"),
+            "enable_hyde": values.get("ENABLE_HYDE", str(base.pipeline.enable_hyde)).lower()
+            in ("1", "true", "yes"),
+            "enable_graph_extraction": values.get(
+                "ENABLE_GRAPH_EXTRACTION", str(base.pipeline.enable_graph_extraction)
+            ).lower() in ("1", "true", "yes"),
+            "enable_generation": values.get(
+                "ENABLE_GENERATION", str(base.pipeline.enable_generation)
+            ).lower() in ("1", "true", "yes"),
+            "embedding_batch_size": int(values.get(
+                "EMBEDDING_BATCH_SIZE", base.pipeline.embedding_batch_size
+            )),
         })
     api = ApiSettings(**{
         **base.api.model_dump(),
@@ -269,8 +333,17 @@ def load_config(profile: Profile | str = Profile.LOCAL, environ: Optional[Mappin
         "visibility_heartbeat_seconds": float(values.get("SQS_VISIBILITY_HEARTBEAT", base.queue.visibility_heartbeat_seconds)),
         "max_attempts": int(values.get("INGESTION_MAX_ATTEMPTS", base.queue.max_attempts)),
         "capacity": int(values.get("INGESTION_QUEUE_CAPACITY", base.queue.capacity)),
+        "poll_timeout_seconds": float(values.get("INGESTION_POLL_SECONDS", base.queue.poll_timeout_seconds)),
+        "retry_min_seconds": float(values.get("INGESTION_RETRY_MIN_SECONDS", base.queue.retry_min_seconds)),
+        "retry_max_seconds": float(values.get("INGESTION_RETRY_MAX_SECONDS", base.queue.retry_max_seconds)),
+        "shutdown_timeout_seconds": float(values.get(
+            "GRACEFUL_SHUTDOWN_SECONDS", base.queue.shutdown_timeout_seconds
+        )),
         "sqs_queue_url": values.get("SQS_QUEUE_URL", base.queue.sqs_queue_url),
         "sqs_dlq_url": values.get("SQS_DLQ_URL", base.queue.sqs_dlq_url),
+        "embedded_dispatcher": values.get(
+            "EMBEDDED_OUTBOX_DISPATCHER", str(base.queue.embedded_dispatcher)
+        ).lower() in ("1", "true", "yes"),
     })
     publication = PublicationSettings(**{
         **base.publication.model_dump(),
@@ -293,9 +366,69 @@ def load_config(profile: Profile | str = Profile.LOCAL, environ: Optional[Mappin
             "DISPATCHER_METRICS_PORT", base.observability.dispatcher_metrics_port
         )),
     })
+    performance = PerformanceSettings(**{
+        **base.performance.model_dump(),
+        "query_timeout_seconds": float(values.get("QUERY_TIMEOUT_SECONDS", base.performance.query_timeout_seconds)),
+        "per_retriever_timeout_seconds": float(values.get(
+            "RETRIEVER_TIMEOUT_SECONDS", base.performance.per_retriever_timeout_seconds
+        )),
+        "query_max_concurrency": int(values.get(
+            "QUERY_MAX_CONCURRENCY", base.performance.query_max_concurrency
+        )),
+        "query_executor_pending": int(values.get(
+            "QUERY_EXECUTOR_PENDING", base.performance.query_executor_pending
+        )),
+        "adaptive_retrieval_mode": values.get(
+            "ADAPTIVE_RETRIEVAL_MODE", base.performance.adaptive_retrieval_mode
+        ),
+        "retriever_workers": int(values.get("RETRIEVER_WORKERS", base.performance.retriever_workers)),
+        "retriever_pending": int(values.get("RETRIEVER_PENDING", base.performance.retriever_pending)),
+        "embedding_concurrency": int(values.get(
+            "EMBEDDING_CONCURRENCY", base.performance.embedding_concurrency
+        )),
+        "rewrite_concurrency": int(values.get("REWRITE_CONCURRENCY", base.performance.rewrite_concurrency)),
+        "graph_concurrency": int(values.get("GRAPH_CONCURRENCY", base.performance.graph_concurrency)),
+        "reranker_concurrency": int(values.get(
+            "RERANKER_CONCURRENCY", base.performance.reranker_concurrency
+        )),
+        "generation_concurrency": int(values.get(
+            "GENERATION_CONCURRENCY", base.performance.generation_concurrency
+        )),
+        "parsing_concurrency": int(values.get("PARSING_CONCURRENCY", base.performance.parsing_concurrency)),
+        "index_concurrency": int(values.get("INDEX_CONCURRENCY", base.performance.index_concurrency)),
+        "reranker_candidate_cap": int(values.get(
+            "RERANKER_CANDIDATE_CAP", base.performance.reranker_candidate_cap
+        )),
+        "reranker_batch_size": int(values.get("RERANKER_BATCH_SIZE", base.performance.reranker_batch_size)),
+        "refill_max_rounds": int(values.get("CANDIDATE_REFILL_ROUNDS", base.performance.refill_max_rounds)),
+        "refill_candidate_cap": int(values.get("CANDIDATE_REFILL_CAP", base.performance.refill_candidate_cap)),
+        "postgres_pool_min": int(values.get("POSTGRES_POOL_MIN", base.performance.postgres_pool_min)),
+        "postgres_pool_max": int(values.get("POSTGRES_POOL_MAX", base.performance.postgres_pool_max)),
+        "qdrant_pool_size": int(values.get("QDRANT_POOL_SIZE", base.performance.qdrant_pool_size)),
+        "cache_ttl_seconds": int(values.get("CACHE_TTL_SECONDS", base.performance.cache_ttl_seconds)),
+        "cache_max_value_bytes": int(values.get(
+            "CACHE_MAX_VALUE_BYTES", base.performance.cache_max_value_bytes
+        )),
+        "breaker_failure_threshold": int(values.get(
+            "CIRCUIT_FAILURE_THRESHOLD", base.performance.breaker_failure_threshold
+        )),
+        "breaker_recovery_seconds": float(values.get(
+            "CIRCUIT_RECOVERY_SECONDS", base.performance.breaker_recovery_seconds
+        )),
+        "embedding_batch_max_tokens": int(values.get(
+            "EMBEDDING_BATCH_MAX_TOKENS", base.performance.embedding_batch_max_tokens
+        )),
+        "embedding_batch_max_bytes": int(values.get(
+            "EMBEDDING_BATCH_MAX_BYTES", base.performance.embedding_batch_max_bytes
+        )),
+        "embedding_memory_budget_bytes": int(values.get(
+            "EMBEDDING_MEMORY_BUDGET_BYTES", base.performance.embedding_memory_budget_bytes
+        )),
+    })
     return AppConfig(
         profile=base.profile, providers=base.providers, storage=storage, models=models, pipeline=pipeline, api=api,
         queue=queue,
         publication=publication,
         observability=observability,
+        performance=performance,
     )

@@ -3,11 +3,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import contextvars
 import threading
 import time
 import uuid
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +32,9 @@ from src.core.contracts import DocumentVersion, IndexingStatus, IngestionTask
 from src.core.events import IngestionEvent, idempotency_key
 from src.core.ports import DocumentChunker, DocumentRepository, ObjectStorage, TaskRepository
 from src.application.ingestion_runtime import OutboxDispatcher
+from src.application.snapshot_cache import PublicationSnapshotCache
+from src.core.cache_keys import retrieval_key
+from src.core.performance import BoundedExecutor, Bulkhead, CapacityExhausted, Deadline, DeadlineExceeded
 from src.core.queue import IngestionQueue
 
 logger = logging.getLogger(__name__)
@@ -357,10 +360,20 @@ class QueryApplicationService:
         self.documents = documents
         self.metrics = metrics
         self.publication = publication
+        self.snapshot_cache = PublicationSnapshotCache(
+            config.performance.snapshot_cache_entries, config.performance.snapshot_cache_ttl_seconds
+        )
+        self.generation_bulkhead = Bulkhead(config.performance.generation_concurrency, "generation")
+        self.generation_executor = BoundedExecutor(
+            config.performance.generation_concurrency,
+            max(config.performance.generation_concurrency, config.performance.query_max_concurrency),
+            "rag-generation",
+        )
 
-    def execute(self, request: QueryRequest, trace_id: str) -> QueryResponse:
+    def execute(self, request: QueryRequest, trace_id: str, authorization_scope: str = "anonymous") -> QueryResponse:
         telemetry = self.metrics.telemetry
         query_started = time.perf_counter()
+        deadline = Deadline.after(self.config.performance.query_timeout_seconds)
         if request.stream:
             raise ApiError(422, "streaming_not_supported", "Streaming is not available in this API version")
         if len(request.query) > self.config.api.max_query_length:
@@ -379,57 +392,77 @@ class QueryApplicationService:
         try:
             snapshot_started = time.perf_counter()
             with self.metrics.observability.span("query.publication_snapshot"):
-                snapshot = self.publication.snapshot() if self.publication else None
+                snapshot = self.snapshot_cache.load(self.publication) if self.publication else None
             telemetry.labels(telemetry.snapshot_duration).observe(time.perf_counter() - snapshot_started)
             telemetry.labels(telemetry.snapshot_documents).observe(len(snapshot.active_versions) if snapshot else 0)
-            candidate_count = request.top_k * (
-                self.config.publication.reconciliation_candidate_multiplier if snapshot else 1
+            execution_mode, adaptive_decision, adaptive_reason = self._execution_mode(
+                request.query, request.retrieval_mode.value
             )
-            with self.metrics.observability.span("query.retrieval", {
-                "rag.strategy": request.retrieval_mode.value, "rag.requested_top_k": request.top_k,
-            }):
-                context = self.application.retrieval.retrieve_context(
-                    request.query, top_k=candidate_count, filters=filters or None, mode=request.retrieval_mode.value
+            telemetry.labels(
+                telemetry.adaptive_decisions, decision=adaptive_decision, reason=adaptive_reason,
+                mode=self.config.performance.adaptive_retrieval_mode,
+            ).inc()
+            candidate_count = min(
+                self.config.performance.refill_candidate_cap,
+                max(request.top_k, request.top_k * 2 if snapshot else request.top_k),
+            )
+            rounds = 0
+            approved: list[Dict[str, Any]] = []
+            degradation_reasons: list[str] = []
+            seen: set[str] = set()
+            while True:
+                deadline.require(0.001)
+                cache_key = retrieval_key(
+                    request.query, snapshot.revision if snapshot else 0,
+                    {"mode": execution_mode, "reranker_cap": self.config.performance.reranker_candidate_cap},
+                    filters, self.config.publication.namespace, authorization_scope, candidate_count,
+                    self.config.pipeline.index_schema_version,
                 )
-            if snapshot:
+
+                def retrieve() -> list[Dict[str, Any]]:
+                    with self.metrics.observability.span("query.retrieval", {
+                        "rag.strategy": execution_mode, "rag.requested_top_k": candidate_count,
+                    }):
+                        result = self.application.retrieval.retrieve_context(
+                            request.query, top_k=candidate_count, filters=filters or None,
+                            mode=execution_mode, deadline=deadline,
+                        )
+                    degradation_reasons.extend(getattr(result, "degraded_reasons", ()))
+                    return list(result)
+
+                retrieval_cache = getattr(self.application, "retrieval_cache", None)
+                raw = retrieval_cache.get_or_compute(cache_key, retrieve) if retrieval_cache else retrieve()
                 filtering_started = time.perf_counter()
-                approved = []
                 with self.metrics.observability.span("query.publication_filter"):
-                    for candidate in context:
-                        metadata = candidate.get("metadata", {})
-                        candidate_document = str(metadata.get("document_id") or candidate.get("document_id") or
-                                                 str(candidate.get("chunk_id", "")).split("#", 1)[0])
-                        candidate_version = str(metadata.get("version_id", ""))
-                        namespace = str(metadata.get("namespace", "default"))
-                        reason = None
-                        if candidate_document in snapshot.tombstones:
-                            reason = "tombstoned"
-                        elif filters.get("document_id") and candidate_document != filters["document_id"]:
-                            reason = "filter"
-                        elif any(metadata.get(key) != value for key, value in filters.items()
-                                 if key != "document_id"):
-                            reason = "filter"
-                        elif namespace != self.config.publication.namespace:
-                            reason = "namespace"
-                        elif candidate_document not in snapshot.active_versions:
-                            reason = "orphaned"
-                        elif snapshot.active_versions[candidate_document] != candidate_version:
-                            reason = "inactive"
-                        if reason:
-                            telemetry.labels(telemetry.discarded, reason=reason).inc()
-                        else:
-                            approved.append(candidate)
-                context = approved[:request.top_k]
+                    filtered = self._filter_candidates(raw, snapshot, filters)
                 telemetry.labels(telemetry.filter_duration).observe(time.perf_counter() - filtering_started)
-                telemetry.labels(telemetry.candidates_filtered).observe(len(context))
-                # Over-fetching is the bounded refill strategy in Stage 4. This records
-                # whether it was needed without issuing an unbounded retrieval loop.
-                refill_rounds = int(len(approved) < request.top_k and len(context) < candidate_count)
-                telemetry.labels(telemetry.refill_rounds).observe(refill_rounds)
-                if len(context) < request.top_k:
-                    logger.info("publication_filter_shortfall", extra={
-                        "component": "publication_filter", "outcome": "empty" if not context else "degraded",
-                    })
+                for candidate in filtered:
+                    identifier = str(candidate.get("chunk_id", ""))
+                    if identifier not in seen:
+                        approved.append(candidate)
+                        seen.add(identifier)
+                if len(approved) >= request.top_k or not snapshot:
+                    break
+                if rounds >= self.config.performance.refill_max_rounds or deadline.remaining <= 0.01:
+                    break
+                next_count = min(self.config.performance.refill_candidate_cap, candidate_count * 2)
+                if next_count == candidate_count:
+                    break
+                rounds += 1
+                candidate_count = next_count
+            context = approved[:request.top_k]
+            telemetry.labels(telemetry.candidates_filtered).observe(len(context))
+            telemetry.labels(telemetry.refill_rounds).observe(rounds)
+            if len(context) < request.top_k:
+                degradation_reasons.append("candidate_shortfall")
+                logger.info("publication_filter_shortfall", extra={
+                    "component": "publication_filter", "outcome": "empty" if not context else "degraded",
+                })
+        except DeadlineExceeded as error:
+            telemetry.labels(telemetry.query_errors, error_type="provider_timeout").inc()
+            telemetry.labels(telemetry.query_requests, outcome="failure", strategy=request.retrieval_mode.value).inc()
+            telemetry.labels(telemetry.query_duration).observe(time.perf_counter() - query_started)
+            raise ApiError(503, "query_timeout", "Query deadline was exceeded", {"Retry-After": "1"}) from error
         except Exception as error:
             telemetry.labels(telemetry.query_errors, error_type="retrieval").inc()
             telemetry.labels(telemetry.query_requests, outcome="failure",
@@ -447,12 +480,32 @@ class QueryApplicationService:
                 empty_context=True, refused=True,
                 publication_revision=snapshot.revision if snapshot else None,
                 graph_index_required=self.config.pipeline.graph_index_required,
+                execution_degraded=bool(degradation_reasons),
+                degradation_reasons=sorted(set(degradation_reasons)),
+                adaptive_route=adaptive_decision,
             )
         try:
-            generation_started = time.perf_counter()
-            with self.metrics.observability.span("query.generation"):
-                answer = "".join(self.application.generator.generate_stream(request.query, context))
-            telemetry.labels(telemetry.generation_duration).observe(time.perf_counter() - generation_started)
+            if not self.config.pipeline.enable_generation or deadline.remaining < 0.05:
+                answer = "Generation was skipped; verified sources are returned."
+                degradation_reasons.append("generation_deadline")
+            else:
+                generation_started = time.perf_counter()
+                with self.metrics.observability.span("query.generation"):
+                    future = self.generation_executor.submit(
+                        contextvars.copy_context().run,
+                        self.generation_bulkhead.run,
+                        lambda: "".join(self.application.generator.generate_stream(request.query, context)),
+                    )
+                    try:
+                        answer = future.result(timeout=deadline.remaining)
+                    except TimeoutError:
+                        future.cancel()
+                        answer = "Generation exceeded the query deadline; verified sources are returned."
+                        degradation_reasons.append("generation_timeout")
+                telemetry.labels(telemetry.generation_duration).observe(time.perf_counter() - generation_started)
+        except CapacityExhausted:
+            answer = "Generation capacity is temporarily unavailable; verified sources are returned."
+            degradation_reasons.append("generation_capacity")
         except Exception as error:
             telemetry.labels(telemetry.query_errors, error_type="generation").inc()
             telemetry.labels(telemetry.query_requests, outcome="failure",
@@ -472,7 +525,57 @@ class QueryApplicationService:
             publication_revision=snapshot.revision if snapshot else None,
             graph_index_required=self.config.pipeline.graph_index_required,
             publication_degraded=degraded,
+            execution_degraded=bool(degradation_reasons),
+            degradation_reasons=sorted(set(degradation_reasons)),
+            adaptive_route=adaptive_decision,
         )
+
+    def close(self) -> None:
+        self.generation_executor.shutdown(wait=False)
+
+    def _filter_candidates(self, context: Iterable[Dict[str, Any]], snapshot: Any,
+                           filters: Dict[str, Any]) -> list[Dict[str, Any]]:
+        if not snapshot:
+            return list(context)
+        approved = []
+        for candidate in context:
+            metadata = candidate.get("metadata", {})
+            document_id = str(metadata.get("document_id") or candidate.get("document_id") or
+                              str(candidate.get("chunk_id", "")).split("#", 1)[0])
+            version_id = str(metadata.get("version_id", ""))
+            namespace = str(metadata.get("namespace", "default"))
+            reason = None
+            if document_id in snapshot.tombstones:
+                reason = "tombstoned"
+            elif filters.get("document_id") and document_id != filters["document_id"]:
+                reason = "filter"
+            elif any(metadata.get(key) != value for key, value in filters.items() if key != "document_id"):
+                reason = "filter"
+            elif namespace != self.config.publication.namespace:
+                reason = "namespace"
+            elif document_id not in snapshot.active_versions:
+                reason = "orphaned"
+            elif snapshot.active_versions[document_id] != version_id:
+                reason = "inactive"
+            if reason:
+                self.metrics.telemetry.labels(self.metrics.telemetry.discarded, reason=reason).inc()
+            else:
+                approved.append(candidate)
+        return approved
+
+    def _execution_mode(self, query: str, requested: str) -> tuple[str, str, str]:
+        configured = self.config.performance.adaptive_retrieval_mode
+        if requested != "hybrid" or configured == "off":
+            return requested, "full", "default_fast_path"
+        lowered = query.casefold()
+        entity_terms = ("relationship", "depends on", "connected", "between", "entity", "calls")
+        if any(term in lowered for term in entity_terms):
+            decision, reason, route = "graph", "entity_query", "adaptive_graph"
+        elif len(query.split()) >= 24:
+            decision, reason, route = "hyde", "complex_query", "adaptive_hyde"
+        else:
+            decision, reason, route = "fast", "default_fast_path", "fast"
+        return ("hybrid" if configured == "shadow" else route), decision, reason
 
     def _source(self, candidate: Dict[str, Any]) -> SourceResponse:
         metadata = candidate.get("metadata", {})
@@ -498,18 +601,20 @@ class ReadinessService:
     def __init__(self, probes: Iterable[Tuple[str, Any, bool]], timeout_seconds: float):
         self.probes = list(probes)
         self.timeout_seconds = timeout_seconds
+        workers = max(1, min(8, len(self.probes)))
+        self.executor = BoundedExecutor(workers, workers, "rag-readiness")
 
     def check(self) -> ReadinessResponse:
         statuses: List[DependencyStatus] = []
         for name, target, required in self.probes:
-            executor = ThreadPoolExecutor(max_workers=1)
-            future = executor.submit(target.is_ready)
             try:
+                future = self.executor.submit(target.is_ready)
                 ready = bool(future.result(timeout=self.timeout_seconds))
             except Exception:
                 ready = False
-            finally:
-                executor.shutdown(wait=False, cancel_futures=True)
             statuses.append(DependencyStatus(name=name, ready=ready, required=required))
         overall = all(status.ready for status in statuses if status.required)
         return ReadinessResponse(status="ready" if overall else "not_ready", dependencies=statuses)
+
+    def close(self) -> None:
+        self.executor.shutdown(wait=False)

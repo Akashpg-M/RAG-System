@@ -31,6 +31,12 @@ class CleanupService:
     def run_once(self) -> int:
         completed = 0
         for job_id, document_id, version_id, job_type in self.publication.pending_cleanup():
+            claim = getattr(self.publication, "claim_cleanup", None)
+            if claim and not claim(job_id):
+                self.observability.metrics.labels(
+                    self.observability.metrics.cleanup_jobs, outcome="premature"
+                ).inc()
+                continue
             started = time.perf_counter()
             try:
                 with self.observability.span("publication.cleanup", {"rag.cleanup_type": job_type}):

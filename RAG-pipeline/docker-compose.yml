@@ -1,3 +1,19 @@
+x-app-environment: &app-environment
+  RAG_PROFILE: local
+  AUTH_ENABLED: "false"
+  INGESTION_QUEUE_BACKEND: redis
+  REDIS_URL: redis://redis:6379/0
+  CONTROL_DATABASE_URL: postgresql+psycopg://rag:rag-local-only@postgres:5432/rag_control
+  QDRANT_URL: http://qdrant:6333
+  SPARSE_DB_PATH: /app/data/sparse_index.db
+  UPLOAD_PATH: /app/data/uploads
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OBSERVABILITY_ENABLED: "true"
+  EMBEDDED_OUTBOX_DISPATCHER: "false"
+  QUERY_MAX_CONCURRENCY: "8"
+  QUERY_EXECUTOR_PENDING: "8"
+  POSTGRES_POOL_MAX: "12"
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -32,6 +48,86 @@ services:
       - "127.0.0.1:6333:6333"
     volumes:
       - qdrant-data:/qdrant/storage
+  migrate:
+    build: .
+    profiles: [application]
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    environment: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+  api:
+    build: .
+    profiles: [application]
+    command: ["python", "-m", "uvicorn", "src.api.app:create_api", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *app-environment
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - rag-application-data:/app/data
+      - model-cache:/root/.cache
+    mem_limit: ${RAG_API_MEMORY_LIMIT:-2g}
+    cpus: ${RAG_API_CPU_LIMIT:-2.0}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 40
+      start_period: 180s
+  worker:
+    build: .
+    profiles: [application]
+    command: ["python", "-m", "src.worker"]
+    environment:
+      <<: *app-environment
+      INGESTION_WORKER_ID: worker-container-1
+      WORKER_METRICS_PORT: "9465"
+    ports:
+      - "127.0.0.1:9465:9465"
+    volumes:
+      - rag-application-data:/app/data
+      - model-cache:/root/.cache
+    mem_limit: ${RAG_WORKER_MEMORY_LIMIT:-2g}
+    cpus: ${RAG_WORKER_CPU_LIMIT:-2.0}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9465/metrics', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 40
+      start_period: 180s
+  dispatcher:
+    build: .
+    profiles: [application]
+    command: ["python", "-m", "src.dispatcher"]
+    environment: *app-environment
+    ports:
+      - "127.0.0.1:9466:9466"
+    mem_limit: ${RAG_DISPATCHER_MEMORY_LIMIT:-384m}
+    cpus: ${RAG_DISPATCHER_CPU_LIMIT:-0.5}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9466/metrics', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
   tempo:
     image: grafana/tempo:2.7.2
     profiles: [observability]
@@ -151,3 +247,5 @@ volumes:
   loki-data:
   prometheus-data:
   grafana-data:
+  rag-application-data:
+  model-cache:

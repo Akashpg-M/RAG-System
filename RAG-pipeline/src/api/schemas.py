@@ -76,6 +76,9 @@ class QueryResponse(BaseModel):
     publication_revision: Optional[int] = None
     graph_index_required: bool = False
     publication_degraded: bool = False
+    execution_degraded: bool = False
+    degradation_reasons: List[str] = Field(default_factory=list)
+    adaptive_route: Optional[str] = None
 
 
 class UploadResponse(BaseModel):

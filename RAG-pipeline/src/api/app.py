@@ -19,6 +19,7 @@ from src.api.services import DocumentControlService, QueryApplicationService, Re
 from src.application.composition import RagApplication, build_application
 from src.application.config import AppConfig, Profile, load_config
 from src.application.ingestion_runtime import IngestionWorker, OutboxDispatcher
+from src.application.query_runtime import QueryRuntime
 from src.infrastructure.ingestion_queues import InMemoryIngestionQueue, RedisStreamsQueue, SQSQueue
 from src.infrastructure.repositories import (
     LocalFileObjectStorage, SQLiteDocumentRepository, SQLiteLeaseRepository, SQLiteTaskRepository,
@@ -82,15 +83,20 @@ def create_api(
     else:
         from src.infrastructure.postgres import PostgresControlPlane
         control = PostgresControlPlane(
-            settings.storage.control_database_url, settings.publication.retention_versions
+            settings.storage.control_database_url, settings.publication.retention_versions,
+            settings.performance.postgres_pool_min, settings.performance.postgres_pool_max,
         )
         documents = tasks = leases = publication = control
     metrics = ApiMetrics(lambda: work_queue.stats().depth, work_queue.stats, publication.stats, telemetry)
     dispatcher = OutboxDispatcher(tasks, work_queue, dispatcher_telemetry)
     document_service = DocumentControlService(
-        rag, settings, storage, documents, tasks, work_queue, metrics, dispatcher, publication
+        rag, settings, storage, documents, tasks, work_queue, metrics,
+        dispatcher if settings.queue.embedded_dispatcher else None, publication,
     )
     query_service = QueryApplicationService(rag, settings, documents, metrics, publication)
+    query_runtime = QueryRuntime(
+        settings.performance.query_max_concurrency, settings.performance.query_executor_pending, telemetry
+    )
     probes = list(readiness_probes) if readiness_probes is not None else [
         ("dense_index", rag.ingestion.vector_store, True),
         ("sparse_index", rag.ingestion.sparse_store, True),
@@ -118,10 +124,12 @@ def create_api(
                 dispatcher.reconcile_queued(documents, settings.pipeline.pipeline_version)
                 dispatcher.dispatch_once()
         metrics.sample_dependencies()
-        dispatcher.reconcile_queued(documents, settings.pipeline.pipeline_version)
-        dispatcher.dispatch_once()
-        dispatch_thread = threading.Thread(target=dispatch_loop, daemon=True, name="outbox-dispatcher")
-        dispatch_thread.start()
+        dispatch_thread = None
+        if settings.queue.embedded_dispatcher:
+            dispatcher.reconcile_queued(documents, settings.pipeline.pipeline_version)
+            dispatcher.dispatch_once()
+            dispatch_thread = threading.Thread(target=dispatch_loop, daemon=True, name="outbox-dispatcher")
+            dispatch_thread.start()
         embedded_worker = None
         worker_thread = None
         if settings.profile is Profile.TEST:
@@ -135,12 +143,19 @@ def create_api(
             worker_thread.start()
         yield
         stop_dispatch.set()
-        dispatch_thread.join(timeout=2)
+        if dispatch_thread:
+            dispatch_thread.join(timeout=2)
         if embedded_worker:
             embedded_worker.stop()
         if worker_thread:
             worker_thread.join(timeout=3)
         work_queue.close()
+        query_runtime.shutdown()
+        query_service.close()
+        readiness_service.close()
+        shutdown = getattr(rag, "shutdown", None)
+        if shutdown:
+            shutdown()
         if rag.queue and hasattr(rag.queue, "shutdown"):
             rag.queue.shutdown()
         telemetry.shutdown()
@@ -160,6 +175,7 @@ def create_api(
     app.state.security = ApiSecurity(settings.api)
     app.state.document_service = document_service
     app.state.query_service = query_service
+    app.state.query_runtime = query_runtime
     app.state.readiness_service = readiness_service
     app.state.observability = telemetry
 
@@ -200,6 +216,7 @@ def create_api(
         return JSONResponse(
             status_code=error.status_code,
             content={"error": error.code, "message": error.message, "trace_id": request.state.trace_id},
+            headers=error.headers,
         )
 
     @app.exception_handler(RequestValidationError)

@@ -14,6 +14,7 @@ src/*.py              Stage 0 compatibility facades and local adapters
 ```
 
 See [architecture.md](docs/architecture.md), [ADR 0001](docs/decisions/0001-provider-independent-core.md), and [ADR 0002](docs/decisions/0002-versioned-http-control-plane.md).
+Stage 6 concurrency, deadlines, caches, circuit breakers, benchmark methodology, and measured results are documented in [performance.md](docs/performance.md).
 
 ## Setup
 
@@ -119,6 +120,21 @@ Deletion writes a PostgreSQL tombstone before physical cleanup. Previous validat
 versions are retained for rollback according to `PUBLICATION_RETENTION_VERSIONS`; cleanup and
 reconciliation are application services and never restore query visibility after a
 physical-deletion failure.
+
+### Containerized application and observability
+
+Run the API, worker, outbox dispatcher, PostgreSQL, Redis, Qdrant, and the optional
+observability stack as separate containers:
+
+```powershell
+docker compose --profile application --profile observability up -d --build
+docker compose ps
+```
+
+The application containers have independent metrics endpoints and configurable CPU/memory
+limits. The API does not run an embedded dispatcher in this profile. Use `docker compose
+logs api worker dispatcher` and the provisioned Grafana instance at
+`http://127.0.0.1:3000` (`admin` / `rag-local-only`) for local-only diagnostics.
 
 ## API endpoints
 

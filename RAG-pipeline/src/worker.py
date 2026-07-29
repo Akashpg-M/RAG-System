@@ -47,7 +47,8 @@ def build_worker() -> IngestionWorker:
     else:
         from src.infrastructure.postgres import PostgresControlPlane
         tasks = documents = leases = publication = PostgresControlPlane(
-            config.storage.control_database_url, config.publication.retention_versions
+            config.storage.control_database_url, config.publication.retention_versions,
+            config.performance.postgres_pool_min, config.performance.postgres_pool_max,
         )
     storage = LocalFileObjectStorage()
     cleanup = CleanupService(publication, documents, storage, application.ingestion)
@@ -85,6 +86,9 @@ def main() -> None:
         worker.run()
     finally:
         worker.queue.close()
+        shutdown = getattr(worker.application, "shutdown", None)
+        if shutdown:
+            shutdown()
         worker.observability.shutdown()
 
 

@@ -1,0 +1,70 @@
+{
+  "benchmark": {
+    "cache_state": "warm",
+    "concurrency": 8,
+    "dataset_version": "stage6-query-set-v1",
+    "maximum_error_rate": 0.01,
+    "measurement_requests": 200,
+    "name": "deterministic-infrastructure",
+    "profile": "test",
+    "queries": [
+      "What deployment technology is described?",
+      "Which database stores control-plane records?",
+      "How are ingestion messages delivered?",
+      "What prevents stale document versions from being queried?"
+    ],
+    "query_timeout_seconds": 5,
+    "schema_version": "1.0",
+    "slo_p95_seconds": 1.0,
+    "warmup_requests": 20
+  },
+  "environment": {
+    "cache_state": "warm",
+    "captured_at": "2026-07-28T18:10:25.627232+00:00",
+    "concurrency": 8,
+    "cpu_logical": 12,
+    "cpu_physical": 6,
+    "dataset_version": "stage6-query-set-v1",
+    "docker": {
+      "cpus": 2,
+      "memory_bytes": 4111769600,
+      "operating_system": "Docker Desktop"
+    },
+    "git": {
+      "dirty": true,
+      "revision": "7d1c9991a376f695277f88a3785ff3dcc017c24f"
+    },
+    "measurement_requests": 200,
+    "memory_available_bytes": 387813376,
+    "memory_total_bytes": 7885529088,
+    "models": {
+      "embedding": "all-MiniLM-L6-v2",
+      "generation": "llama-3.3-70b-versatile",
+      "reranker": "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    },
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.12.0",
+    "warmup_requests": 20
+  },
+  "label": "stage6-deterministic-optimized",
+  "result": {
+    "duration_seconds": 1.0863342999946326,
+    "ended_at": "2026-07-28T18:10:30.130162+00:00",
+    "error_rate": 0.375,
+    "latency_seconds": {
+      "mean": 0.04285202499857405,
+      "p50": 0.040933300042524934,
+      "p95": 0.06273459998192266,
+      "p99": 0.07497000001603737
+    },
+    "rejection_rate": 0.375,
+    "sample_count": 200,
+    "started_at": "2026-07-28T18:10:29.044364+00:00",
+    "status_counts": {
+      "200": 125,
+      "503": 75
+    },
+    "throughput_qps": 184.1053900267976
+  },
+  "schema_version": "1.0"
+}
